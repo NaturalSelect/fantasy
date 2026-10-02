@@ -1227,7 +1227,9 @@ func decodeToolCallInputMap(toolCall fantasy.ToolCallPart) (map[string]any, *fan
 		return map[string]any{}, nil
 	}
 	var inputMap map[string]any
-	if err := json.Unmarshal([]byte(toolCall.Input), &inputMap); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(toolCall.Input))
+	decoder.UseNumber()
+	if err := decoder.Decode(&inputMap); err != nil {
 		return map[string]any{}, &fantasy.CallWarning{
 			Type: fantasy.CallWarningTypeOther,
 			Message: fmt.Sprintf(
@@ -1250,7 +1252,9 @@ func decodeToolCallInputAny(toolCall fantasy.ToolCallPart) (any, *fantasy.CallWa
 		return nil, nil
 	}
 	var inputAny any
-	if err := json.Unmarshal([]byte(toolCall.Input), &inputAny); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(toolCall.Input))
+	decoder.UseNumber()
+	if err := decoder.Decode(&inputAny); err != nil {
 		return nil, &fantasy.CallWarning{
 			Type: fantasy.CallWarningTypeOther,
 			Message: fmt.Sprintf(
