@@ -4674,6 +4674,7 @@ func TestResponsesToPrompt_ReasoningWithStore(t *testing.T) {
 				ItemID:           reasoningItemID,
 				EncryptedContent: &encryptedContent,
 				Summary:          []string{},
+				Finalized:        true,
 			},
 		},
 	}
