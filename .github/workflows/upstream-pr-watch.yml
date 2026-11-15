@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: upstream-pr-watch
+
+# NOTE: Failure emails go to whoever last changed the cron line, so push this file from the account that should be notified.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: charmbracelet/fantasy
+  UPSTREAM_PR: "407"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail once the upstream PR is merged
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if ! pr=$(gh api "repos/${UPSTREAM_REPO}/pulls/${UPSTREAM_PR}"); then
+            echo "::error title=Watch is broken::Could not read ${UPSTREAM_REPO}#${UPSTREAM_PR}."
+            exit 1
+          fi
+
+          if [ "$(jq -r '.merged' <<<"$pr")" = "true" ]; then
+            at=$(jq -r '.merged_at' <<<"$pr")
+            sha=$(jq -r '.merge_commit_sha' <<<"$pr")
+            echo "::error title=Upstream PR merged::${UPSTREAM_REPO}#${UPSTREAM_PR} was merged at ${at} as ${sha}. Drop the downstream replace directive and upgrade."
+            exit 1
+          fi
+
+          echo "${UPSTREAM_REPO}#${UPSTREAM_PR} is $(jq -r '.state' <<<"$pr") and not merged."
