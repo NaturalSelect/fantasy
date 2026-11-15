@@ -4,6 +4,7 @@ name: upstream-pr-pick
 
 # NOTE: Commits are matched by the "(cherry picked from commit ...)" trailer that git cherry-pick -x writes, so rebased copies still count as present.
 # NOTE: Pushes made with GITHUB_TOKEN do not trigger the build workflow.
+# NOTE: Runs regardless of the upstream PR state, so delete this workflow when the fork is retired.
 on:
   schedule:
     - cron: "47 3 * * *"
@@ -11,7 +12,6 @@ on:
 
 env:
   UPSTREAM_REPO: charmbracelet/fantasy
-  UPSTREAM_BRANCH: main
   UPSTREAM_PR: "407"
 
 permissions:
@@ -37,19 +37,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          merged=$(gh api "repos/${UPSTREAM_REPO}/pulls/${UPSTREAM_PR}" --jq .merged)
-          if [ "$merged" = "true" ]; then
-            echo "::notice title=Nothing to pick::${UPSTREAM_REPO}#${UPSTREAM_PR} is merged upstream, so its commits are left alone."
-            exit 0
-          fi
-
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
-            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}" \
             "+refs/pull/${UPSTREAM_PR}/head:refs/remotes/upstream/pr-${UPSTREAM_PR}"
 
-          base=$(git merge-base "upstream/${UPSTREAM_BRANCH}" "upstream/pr-${UPSTREAM_PR}")
+          # NOTE: The PR commit list comes from the API because diffing against upstream main is empty once the PR is merged.
+          commits=$(gh api --paginate "repos/${UPSTREAM_REPO}/pulls/${UPSTREAM_PR}/commits" --jq '.[].sha')
+          if [ -z "$commits" ]; then
+            echo "::error title=No commits::The API returned no commits for ${UPSTREAM_REPO}#${UPSTREAM_PR}."
+            exit 1
+          fi
+
           missing=()
-          for sha in $(git rev-list --topo-order --reverse "${base}..upstream/pr-${UPSTREAM_PR}"); do
+          for sha in $commits; do
             if git merge-base --is-ancestor "$sha" HEAD; then
               continue
             fi
