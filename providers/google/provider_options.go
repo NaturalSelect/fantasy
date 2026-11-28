@@ -9,14 +9,22 @@ import (
 
 // Global type identifiers for Google-specific provider data.
 const (
-	TypeProviderOptions   = Name + ".options"
-	TypeReasoningMetadata = Name + ".reasoning_metadata"
+	TypeProviderOptions      = Name + ".options"
+	TypeProviderImageOptions = Name + ".image_options"
+	TypeReasoningMetadata    = Name + ".reasoning_metadata"
 )
 
 // Register Google provider-specific types with the global registry.
 func init() {
 	fantasy.RegisterProviderType(TypeProviderOptions, func(data []byte) (fantasy.ProviderOptionsData, error) {
 		var v ProviderOptions
+		if err := json.Unmarshal(data, &v); err != nil {
+			return nil, err
+		}
+		return &v, nil
+	})
+	fantasy.RegisterProviderType(TypeProviderImageOptions, func(data []byte) (fantasy.ProviderOptionsData, error) {
+		var v ImageProviderOptions
 		if err := json.Unmarshal(data, &v); err != nil {
 			return nil, err
 		}
@@ -133,6 +141,40 @@ func (o *ProviderOptions) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*o = ProviderOptions(p)
+	return nil
+}
+
+// ImageProviderOptions represents additional options for Google image generation.
+// Fields marked Imagen only are ignored, with a warning, by Gemini image models.
+type ImageProviderOptions struct {
+	// ImageSize is the output resolution, e.g. "1K" or "2K".
+	ImageSize        *string `json:"image_size"`
+	PersonGeneration *string `json:"person_generation"`
+	OutputMIMEType   *string `json:"output_mime_type"`
+
+	// Imagen only.
+	NegativePrompt    *string  `json:"negative_prompt"`
+	GuidanceScale     *float64 `json:"guidance_scale"`
+	SafetyFilterLevel *string  `json:"safety_filter_level"`
+}
+
+// Options implements the ProviderOptionsData interface for ImageProviderOptions.
+func (o *ImageProviderOptions) Options() {}
+
+// MarshalJSON implements custom JSON marshaling with type info for ImageProviderOptions.
+func (o ImageProviderOptions) MarshalJSON() ([]byte, error) {
+	type plain ImageProviderOptions
+	return fantasy.MarshalProviderType(TypeProviderImageOptions, plain(o))
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling with type info for ImageProviderOptions.
+func (o *ImageProviderOptions) UnmarshalJSON(data []byte) error {
+	type plain ImageProviderOptions
+	var p plain
+	if err := fantasy.UnmarshalProviderType(data, &p); err != nil {
+		return err
+	}
+	*o = ImageProviderOptions(p)
 	return nil
 }
 

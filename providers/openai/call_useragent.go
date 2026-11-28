@@ -53,3 +53,18 @@ func objectCallHeadersRequestOptions(call fantasy.ObjectCall) []option.RequestOp
 	}
 	return opts
 }
+
+// imageCallRequestOptions returns the per-request User-Agent and header
+// overrides carried by an ImageCall.
+func imageCallRequestOptions(call fantasy.ImageCall) []option.RequestOption {
+	var opts []option.RequestOption
+	if ua, ok := httpheaders.CallUserAgent(call.UserAgent); ok {
+		opts = append(opts, option.WithHeader("User-Agent", ua))
+	}
+	if headers, ok := httpheaders.CallHeaders(call.Headers); ok {
+		for k, v := range headers {
+			opts = append(opts, option.WithHeader(k, v))
+		}
+	}
+	return opts
+}

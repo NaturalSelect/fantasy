@@ -34,6 +34,8 @@ const (
 	TypeProviderOptions     = Name + ".options"
 	TypeProviderFileOptions = Name + ".file_options"
 	TypeProviderMetadata    = Name + ".metadata"
+
+	TypeProviderImageOptions = Name + ".image_options"
 )
 
 // Register OpenAI provider-specific types with the global registry.
@@ -54,6 +56,13 @@ func init() {
 	})
 	fantasy.RegisterProviderType(TypeProviderMetadata, func(data []byte) (fantasy.ProviderOptionsData, error) {
 		var v ProviderMetadata
+		if err := json.Unmarshal(data, &v); err != nil {
+			return nil, err
+		}
+		return &v, nil
+	})
+	fantasy.RegisterProviderType(TypeProviderImageOptions, func(data []byte) (fantasy.ProviderOptionsData, error) {
+		var v ImageProviderOptions
 		if err := json.Unmarshal(data, &v); err != nil {
 			return nil, err
 		}
@@ -184,6 +193,45 @@ func (o *ProviderFileOptions) UnmarshalJSON(data []byte) error {
 	}
 	*o = ProviderFileOptions(p)
 	return nil
+}
+
+// ImageProviderOptions represents additional options for OpenAI image generation.
+type ImageProviderOptions struct {
+	Quality           *string `json:"quality"`
+	Background        *string `json:"background"`
+	OutputFormat      *string `json:"output_format"`
+	OutputCompression *int64  `json:"output_compression"`
+	// Moderation and Style only apply when generating without reference images.
+	Moderation *string `json:"moderation"`
+	Style      *string `json:"style"`
+	User       *string `json:"user"`
+}
+
+// Options implements the ProviderOptions interface.
+func (*ImageProviderOptions) Options() {}
+
+// MarshalJSON implements custom JSON marshaling with type info for ImageProviderOptions.
+func (o ImageProviderOptions) MarshalJSON() ([]byte, error) {
+	type plain ImageProviderOptions
+	return fantasy.MarshalProviderType(TypeProviderImageOptions, plain(o))
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling with type info for ImageProviderOptions.
+func (o *ImageProviderOptions) UnmarshalJSON(data []byte) error {
+	type plain ImageProviderOptions
+	var p plain
+	if err := fantasy.UnmarshalProviderType(data, &p); err != nil {
+		return err
+	}
+	*o = ImageProviderOptions(p)
+	return nil
+}
+
+// NewImageProviderOptions creates new image generation options for OpenAI.
+func NewImageProviderOptions(opts *ImageProviderOptions) fantasy.ProviderOptions {
+	return fantasy.ProviderOptions{
+		Name: opts,
+	}
 }
 
 // ReasoningEffortOption creates a pointer to a ReasoningEffort value.

@@ -163,24 +163,7 @@ type languageModel struct {
 	objectMode      fantasy.ObjectMode
 }
 
-// LanguageModel implements fantasy.Provider.
-func (a *provider) LanguageModel(ctx context.Context, modelID string) (fantasy.LanguageModel, error) {
-	if strings.Contains(modelID, "anthropic") || strings.Contains(modelID, "claude") {
-		anthropicOpts := []anthropic.Option{
-			anthropic.WithVertex(a.options.project, a.options.location),
-			anthropic.WithHTTPClient(a.options.client),
-			anthropic.WithSkipAuth(a.options.skipAuth),
-		}
-		if a.options.userAgent != "" {
-			anthropicOpts = append(anthropicOpts, anthropic.WithUserAgent(a.options.userAgent))
-		}
-		p, err := anthropic.New(anthropicOpts...)
-		if err != nil {
-			return nil, err
-		}
-		return p.LanguageModel(ctx, modelID)
-	}
-
+func (a *provider) newClient(ctx context.Context) (*genai.Client, error) {
 	cc := &genai.ClientConfig{
 		HTTPClient: wrapHTTPClient(a.options.client),
 		Backend:    a.options.backend,
@@ -207,7 +190,28 @@ func (a *provider) LanguageModel(ctx context.Context, modelID string) (fantasy.L
 		BaseURL: a.options.baseURL,
 		Headers: headers,
 	}
-	client, err := genai.NewClient(ctx, cc)
+	return genai.NewClient(ctx, cc)
+}
+
+// LanguageModel implements fantasy.Provider.
+func (a *provider) LanguageModel(ctx context.Context, modelID string) (fantasy.LanguageModel, error) {
+	if strings.Contains(modelID, "anthropic") || strings.Contains(modelID, "claude") {
+		anthropicOpts := []anthropic.Option{
+			anthropic.WithVertex(a.options.project, a.options.location),
+			anthropic.WithHTTPClient(a.options.client),
+			anthropic.WithSkipAuth(a.options.skipAuth),
+		}
+		if a.options.userAgent != "" {
+			anthropicOpts = append(anthropicOpts, anthropic.WithUserAgent(a.options.userAgent))
+		}
+		p, err := anthropic.New(anthropicOpts...)
+		if err != nil {
+			return nil, err
+		}
+		return p.LanguageModel(ctx, modelID)
+	}
+
+	client, err := a.newClient(ctx)
 	if err != nil {
 		return nil, err
 	}
