@@ -190,6 +190,10 @@ func (a *provider) newClient(ctx context.Context) (*genai.Client, error) {
 		BaseURL: a.options.baseURL,
 		Headers: headers,
 	}
+	if cc.Backend == genai.BackendGeminiAPI {
+		// NOTE: genai v1.78.0 changed the default to v1, but the Decisions API only exists on v1beta.
+		cc.HTTPOptions.APIVersion = "v1beta"
+	}
 	return genai.NewClient(ctx, cc)
 }
 

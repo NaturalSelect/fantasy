@@ -22,7 +22,7 @@ require (
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/net v0.63.0
 	golang.org/x/oauth2 v0.38.0
-	google.golang.org/genai v1.76.0
+	google.golang.org/genai v1.79.1
 )
 
 require (

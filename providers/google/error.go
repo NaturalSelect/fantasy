@@ -2,17 +2,25 @@ package google
 
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"charm.land/fantasy"
 	"google.golang.org/genai"
+	"google.golang.org/genai/interactions/models/apierrors"
 )
 
 var googleContextPattern = regexp.MustCompile(`input token count.*?(\d+).*?exceeds.*?maximum.*?(\d+)`)
 
 func toProviderErr(err error) error {
+	if apiErr, ok := errors.AsType[*apierrors.APIError](err); ok {
+		return toInteractionsProviderErr(err, apiErr)
+	}
+
 	apiErr, ok := errors.AsType[genai.APIError](err)
 	if !ok {
 		// Wrap transient transport failures so `.IsRetryable()` works.
@@ -31,6 +39,57 @@ func toProviderErr(err error) error {
 	parseContextTooLargeError(apiErr.Message, providerErr)
 
 	return providerErr
+}
+
+// interactionsErrorBody is the error envelope of the Interactions-style APIs
+// such as Decisions. Unlike the generateContent API, its code can be a string
+// like "safety" instead of a number.
+type interactionsErrorBody struct {
+	Error struct {
+		Code    json.RawMessage `json:"code"`
+		Message string          `json:"message"`
+		Status  string          `json:"status"`
+	} `json:"error"`
+}
+
+func toInteractionsProviderErr(err error, apiErr *apierrors.APIError) *fantasy.ProviderError {
+	var body interactionsErrorBody
+	_ = json.Unmarshal([]byte(apiErr.Body), &body) // best-effort; falls back to the SDK message on parse failure.
+
+	// NOTE: A numeric code stays empty here, so the status name is used instead.
+	var code string
+	_ = json.Unmarshal(body.Error.Code, &code)
+
+	message := cmp.Or(body.Error.Message, apiErr.Message)
+	providerErr := &fantasy.ProviderError{
+		Message:      message,
+		Title:        cmp.Or(fantasy.ErrorTitleForStatusCode(apiErr.StatusCode), "provider request failed"),
+		Cause:        err,
+		StatusCode:   apiErr.StatusCode,
+		ResponseBody: []byte(apiErr.Body),
+		ErrorType:    cmp.Or(code, body.Error.Status),
+	}
+	if response := apiErr.RawResponse; response != nil {
+		providerErr.ResponseHeaders = toHeaderMap(response.Header)
+		if response.Request != nil && response.Request.URL != nil {
+			providerErr.URL = response.Request.URL.String()
+		}
+	}
+
+	parseContextTooLargeError(message, providerErr)
+
+	return providerErr
+}
+
+func toHeaderMap(in http.Header) map[string]string {
+	out := make(map[string]string, len(in)*2)
+	for k, v := range in {
+		if l := len(v); l > 0 {
+			out[k] = v[l-1]
+			out[strings.ToLower(k)] = v[l-1]
+		}
+	}
+	return out
 }
 
 func parseContextTooLargeError(message string, providerErr *fantasy.ProviderError) {

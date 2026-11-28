@@ -113,6 +113,7 @@ func TestImageModel_Gemini(t *testing.T) {
 		})
 		require.NoError(t, err)
 
+		require.True(t, strings.HasPrefix(request.path, "/v1beta/"), request.path)
 		require.True(t, strings.HasSuffix(request.path, "gemini-2.5-flash-image:generateContent"), request.path)
 		contents := request.body["contents"].([]any)
 		require.Len(t, contents, 1)
