@@ -68,3 +68,18 @@ func imageCallRequestOptions(call fantasy.ImageCall) []option.RequestOption {
 	}
 	return opts
 }
+
+// embeddingCallRequestOptions returns the per-request User-Agent and header
+// overrides carried by an EmbeddingCall.
+func embeddingCallRequestOptions(call fantasy.EmbeddingCall) []option.RequestOption {
+	var opts []option.RequestOption
+	if ua, ok := httpheaders.CallUserAgent(call.UserAgent); ok {
+		opts = append(opts, option.WithHeader("User-Agent", ua))
+	}
+	if headers, ok := httpheaders.CallHeaders(call.Headers); ok {
+		for k, v := range headers {
+			opts = append(opts, option.WithHeader(k, v))
+		}
+	}
+	return opts
+}

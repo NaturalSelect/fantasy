@@ -9,9 +9,10 @@ import (
 
 // Global type identifiers for Google-specific provider data.
 const (
-	TypeProviderOptions      = Name + ".options"
-	TypeProviderImageOptions = Name + ".image_options"
-	TypeReasoningMetadata    = Name + ".reasoning_metadata"
+	TypeProviderOptions          = Name + ".options"
+	TypeProviderImageOptions     = Name + ".image_options"
+	TypeProviderEmbeddingOptions = Name + ".embedding_options"
+	TypeReasoningMetadata        = Name + ".reasoning_metadata"
 )
 
 // Register Google provider-specific types with the global registry.
@@ -25,6 +26,13 @@ func init() {
 	})
 	fantasy.RegisterProviderType(TypeProviderImageOptions, func(data []byte) (fantasy.ProviderOptionsData, error) {
 		var v ImageProviderOptions
+		if err := json.Unmarshal(data, &v); err != nil {
+			return nil, err
+		}
+		return &v, nil
+	})
+	fantasy.RegisterProviderType(TypeProviderEmbeddingOptions, func(data []byte) (fantasy.ProviderOptionsData, error) {
+		var v EmbeddingProviderOptions
 		if err := json.Unmarshal(data, &v); err != nil {
 			return nil, err
 		}
@@ -176,6 +184,66 @@ func (o *ImageProviderOptions) UnmarshalJSON(data []byte) error {
 	}
 	*o = ImageProviderOptions(p)
 	return nil
+}
+
+// Task types for EmbeddingProviderOptions.TaskType. Only gemini-embedding-001
+// takes them.
+const (
+	TaskTypeRetrievalQuery     = "RETRIEVAL_QUERY"
+	TaskTypeRetrievalDocument  = "RETRIEVAL_DOCUMENT"
+	TaskTypeSemanticSimilarity = "SEMANTIC_SIMILARITY"
+	TaskTypeClassification     = "CLASSIFICATION"
+	TaskTypeClustering         = "CLUSTERING"
+	TaskTypeQuestionAnswering  = "QUESTION_ANSWERING"
+	TaskTypeFactVerification   = "FACT_VERIFICATION"
+	TaskTypeCodeRetrievalQuery = "CODE_RETRIEVAL_QUERY"
+)
+
+// EmbeddingProviderOptions represents additional options for Google embeddings.
+// The service validates them, so a model that does not support an option
+// answers with an error.
+type EmbeddingProviderOptions struct {
+	// TaskType is what the vectors are used for, see the TaskType constants.
+	// It only applies to gemini-embedding-001. gemini-embedding-2 rejects it,
+	// so put the task in the text instead, e.g. as a "task: search result | query: " prefix.
+	TaskType *string `json:"task_type"`
+	// Title describes the text. It only has an effect with the
+	// RETRIEVAL_DOCUMENT task type.
+	Title *string `json:"title"`
+
+	// DocumentOCR reads the text of document inputs. Vertex only: the Gemini API
+	// backend rejects it before the request is sent.
+	DocumentOCR *bool `json:"document_ocr"`
+	// AudioTrackExtraction embeds the audio track of video inputs. Vertex only:
+	// the Gemini API backend rejects it before the request is sent.
+	AudioTrackExtraction *bool `json:"audio_track_extraction"`
+}
+
+// Options implements the ProviderOptionsData interface for EmbeddingProviderOptions.
+func (o *EmbeddingProviderOptions) Options() {}
+
+// MarshalJSON implements custom JSON marshaling with type info for EmbeddingProviderOptions.
+func (o EmbeddingProviderOptions) MarshalJSON() ([]byte, error) {
+	type plain EmbeddingProviderOptions
+	return fantasy.MarshalProviderType(TypeProviderEmbeddingOptions, plain(o))
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling with type info for EmbeddingProviderOptions.
+func (o *EmbeddingProviderOptions) UnmarshalJSON(data []byte) error {
+	type plain EmbeddingProviderOptions
+	var p plain
+	if err := fantasy.UnmarshalProviderType(data, &p); err != nil {
+		return err
+	}
+	*o = EmbeddingProviderOptions(p)
+	return nil
+}
+
+// NewEmbeddingProviderOptions creates new embedding options for Google.
+func NewEmbeddingProviderOptions(opts *EmbeddingProviderOptions) fantasy.ProviderOptions {
+	return fantasy.ProviderOptions{
+		Name: opts,
+	}
 }
 
 // ParseOptions parses provider options from a map for the Google provider.

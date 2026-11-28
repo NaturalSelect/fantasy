@@ -42,6 +42,16 @@ func withImageCallUA(ctx context.Context, call fantasy.ImageCall) context.Contex
 	return ctx
 }
 
+func withEmbeddingCallUA(ctx context.Context, call fantasy.EmbeddingCall) context.Context {
+	if ua, ok := httpheaders.CallUserAgent(call.UserAgent); ok {
+		ctx = context.WithValue(ctx, callUAKey{}, ua)
+	}
+	if headers, ok := httpheaders.CallHeaders(call.Headers); ok {
+		ctx = context.WithValue(ctx, callHeadersKey{}, headers)
+	}
+	return ctx
+}
+
 func withDecisionCallUA(ctx context.Context, call fantasy.DecisionCall) context.Context {
 	if ua, ok := httpheaders.CallUserAgent(call.UserAgent); ok {
 		ctx = context.WithValue(ctx, callUAKey{}, ua)

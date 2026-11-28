@@ -235,6 +235,11 @@ func (o *provider) ImageModel(_ context.Context, modelID string) (fantasy.ImageM
 	return newImageModel(modelID, o.options.name, o.newClient()), nil
 }
 
+// EmbeddingModel implements fantasy.EmbeddingModelProvider.
+func (o *provider) EmbeddingModel(_ context.Context, modelID string) (fantasy.EmbeddingModel, error) {
+	return newEmbeddingModel(modelID, o.options.name, o.newClient()), nil
+}
+
 func (o *provider) isResponsesModel(modelID string) bool {
 	if o.options.responsesAPIFunc != nil {
 		return o.options.responsesAPIFunc(modelID)

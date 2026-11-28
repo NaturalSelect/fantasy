@@ -36,6 +36,8 @@ const (
 	TypeProviderMetadata    = Name + ".metadata"
 
 	TypeProviderImageOptions = Name + ".image_options"
+
+	TypeProviderEmbeddingOptions = Name + ".embedding_options"
 )
 
 // Register OpenAI provider-specific types with the global registry.
@@ -63,6 +65,13 @@ func init() {
 	})
 	fantasy.RegisterProviderType(TypeProviderImageOptions, func(data []byte) (fantasy.ProviderOptionsData, error) {
 		var v ImageProviderOptions
+		if err := json.Unmarshal(data, &v); err != nil {
+			return nil, err
+		}
+		return &v, nil
+	})
+	fantasy.RegisterProviderType(TypeProviderEmbeddingOptions, func(data []byte) (fantasy.ProviderOptionsData, error) {
+		var v EmbeddingProviderOptions
 		if err := json.Unmarshal(data, &v); err != nil {
 			return nil, err
 		}
@@ -229,6 +238,38 @@ func (o *ImageProviderOptions) UnmarshalJSON(data []byte) error {
 
 // NewImageProviderOptions creates new image generation options for OpenAI.
 func NewImageProviderOptions(opts *ImageProviderOptions) fantasy.ProviderOptions {
+	return fantasy.ProviderOptions{
+		Name: opts,
+	}
+}
+
+// EmbeddingProviderOptions represents additional options for OpenAI embeddings.
+type EmbeddingProviderOptions struct {
+	User *string `json:"user"`
+}
+
+// Options implements the ProviderOptions interface.
+func (*EmbeddingProviderOptions) Options() {}
+
+// MarshalJSON implements custom JSON marshaling with type info for EmbeddingProviderOptions.
+func (o EmbeddingProviderOptions) MarshalJSON() ([]byte, error) {
+	type plain EmbeddingProviderOptions
+	return fantasy.MarshalProviderType(TypeProviderEmbeddingOptions, plain(o))
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling with type info for EmbeddingProviderOptions.
+func (o *EmbeddingProviderOptions) UnmarshalJSON(data []byte) error {
+	type plain EmbeddingProviderOptions
+	var p plain
+	if err := fantasy.UnmarshalProviderType(data, &p); err != nil {
+		return err
+	}
+	*o = EmbeddingProviderOptions(p)
+	return nil
+}
+
+// NewEmbeddingProviderOptions creates new embedding options for OpenAI.
+func NewEmbeddingProviderOptions(opts *EmbeddingProviderOptions) fantasy.ProviderOptions {
 	return fantasy.ProviderOptions{
 		Name: opts,
 	}
