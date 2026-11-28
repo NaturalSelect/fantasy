@@ -1,0 +1,88 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: upstream-sync
+
+# NOTE: A commit counts as present when a fork commit has the same patch or carries the "(cherry picked from commit ...)" trailer that git cherry-pick -x writes.
+# NOTE: A pick whose change the fork already has becomes an empty commit, which records it so it is not retried on every run.
+# NOTE: Pushing upstream changes under .github/workflows needs a PAT with the workflow scope in the UPSTREAM_SYNC_TOKEN secret.
+# NOTE: Pushes made with GITHUB_TOKEN do not trigger the build workflow, so build and test run here before pushing.
+# NOTE: Runs ahead of upstream-pr-pick so that workflow starts from the updated main.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: charmbracelet/fantasy
+  UPSTREAM_BRANCH: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Cherry-pick missing upstream commits
+        id: pick
+        run: |
+          set -euo pipefail
+
+          upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            "+refs/heads/${UPSTREAM_BRANCH}:${upstream_ref}"
+
+          candidates=$(git rev-list --reverse --no-merges --right-only --cherry-pick "HEAD...${upstream_ref}")
+
+          missing=()
+          for sha in $candidates; do
+            if [ -n "$(git log -1 --format=%H --fixed-strings --grep="(cherry picked from commit ${sha})" "${upstream_ref}..HEAD")" ]; then
+              continue
+            fi
+            missing+=("$sha")
+          done
+
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "Already contains every commit of ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}."
+            exit 0
+          fi
+
+          echo "Missing ${#missing[@]} commit(s):"
+          git log --no-walk=unsorted --oneline "${missing[@]}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git cherry-pick -x --keep-redundant-commits "${missing[@]}"; then
+            git cherry-pick --abort || true
+            echo "::error title=Cherry-pick failed::Could not apply ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} cleanly. Resolve it by hand."
+            exit 1
+          fi
+
+          echo "picked=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v7
+        if: steps.pick.outputs.picked == 'true'
+        with:
+          go-version-file: ./go.mod
+
+      - name: Build and test before pushing
+        if: steps.pick.outputs.picked == 'true'
+        run: |
+          go build ./...
+          go test ./... -count=1 -timeout=30m
+
+      - name: Push
+        if: steps.pick.outputs.picked == 'true'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: git push origin "HEAD:refs/heads/${DEFAULT_BRANCH}"
