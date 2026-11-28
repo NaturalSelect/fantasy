@@ -238,6 +238,9 @@ func (o *ImageProviderOptions) UnmarshalJSON(data []byte) error {
 
 // NewImageProviderOptions creates new image generation options for OpenAI.
 func NewImageProviderOptions(opts *ImageProviderOptions) fantasy.ProviderOptions {
+	if opts == nil {
+		return fantasy.ProviderOptions{}
+	}
 	return fantasy.ProviderOptions{
 		Name: opts,
 	}
@@ -270,6 +273,9 @@ func (o *EmbeddingProviderOptions) UnmarshalJSON(data []byte) error {
 
 // NewEmbeddingProviderOptions creates new embedding options for OpenAI.
 func NewEmbeddingProviderOptions(opts *EmbeddingProviderOptions) fantasy.ProviderOptions {
+	if opts == nil {
+		return fantasy.ProviderOptions{}
+	}
 	return fantasy.ProviderOptions{
 		Name: opts,
 	}

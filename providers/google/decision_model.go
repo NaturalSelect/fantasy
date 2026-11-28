@@ -4,12 +4,16 @@ import (
 	"cmp"
 	"context"
 	"encoding/base64"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"maps"
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"charm.land/fantasy"
 	"google.golang.org/genai"
@@ -42,10 +46,11 @@ var _ fantasy.DecisionModelProvider = (*provider)(nil)
 // DecisionModel implements fantasy.DecisionModelProvider using the Gemini
 // Decisions API. It is only available on the Gemini Developer API backend.
 func (a *provider) DecisionModel(ctx context.Context, modelID string) (fantasy.DecisionModel, error) {
-	if a.options.backend == genai.BackendVertexAI {
+	backend := a.effectiveBackend()
+	if backend != genai.BackendGeminiAPI {
 		return nil, &fantasy.Error{Title: "unsupported", Message: "the Gemini Decisions API is only available on the Gemini Developer API backend"}
 	}
-	client, err := a.newClient(ctx)
+	client, err := a.newClientForBackend(ctx, backend)
 	if err != nil {
 		return nil, err
 	}
@@ -89,9 +94,14 @@ func (m *decisionModel) Decide(ctx context.Context, call fantasy.DecisionCall) (
 		},
 	}, operations.WithRetries(retry.Config{Strategy: "none"}))
 	if err != nil {
+		// NOTE: genai does not export a distinct error type for response decoding failures.
+		if strings.HasPrefix(err.Error(), "error unmarshaling json response body:") {
+			return nil, &fantasy.Error{Title: "invalid response", Message: "could not decode the decision response", Cause: err}
+		}
 		return nil, toProviderErr(err)
 	}
-	return m.toResponse(call.Questions, result.CreateDecisionResponse)
+	defer result.HTTPMeta.Response.Body.Close()
+	return m.toResponse(call, result)
 }
 
 func invalidDecisionArgument(format string, args ...any) error {
@@ -103,15 +113,15 @@ func invalidDecisionResponse(format string, args ...any) error {
 }
 
 func decisionInput(parts []fantasy.MessagePart) (decisions.Input, error) {
-	if len(parts) == 1 {
-		if text, ok := fantasy.AsMessagePart[fantasy.TextPart](parts[0]); ok {
-			return decisions.NewInput(text.Text), nil
-		}
-	}
-
 	contents := make([]decisions.DecisionInputContent, 0, len(parts))
 	for i, part := range parts {
 		if text, ok := fantasy.AsMessagePart[fantasy.TextPart](part); ok {
+			if text.Text == "" {
+				return decisions.Input{}, invalidDecisionArgument("input part %d: text must not be empty", i)
+			}
+			if len(parts) == 1 {
+				return decisions.NewInput(text.Text), nil
+			}
 			contents = append(contents, decisions.NewDecisionInputContent(gi.TextContent{Text: text.Text}))
 			continue
 		}
@@ -193,6 +203,15 @@ func choiceQuestion(q fantasy.ChoiceQuestion) (decisions.Question, error) {
 	}
 	criteria := make(map[string]string, len(q.Options))
 	for _, option := range q.Options {
+		name := option.Name
+		if !utf8.ValidString(name) || len(name) > 512 || utf8.RuneCountInString(name) > 128 {
+			return decisions.Question{}, invalidDecisionArgument("option name must be valid UTF-8 of at most 128 characters and 512 bytes")
+		}
+		if strings.HasPrefix(name, " ") || strings.HasSuffix(name, " ") || strings.ContainsFunc(name, func(r rune) bool {
+			return unicode.IsControl(r) || r != ' ' && unicode.IsSpace(r)
+		}) {
+			return decisions.Question{}, invalidDecisionArgument("option name %q contains a disallowed space or control character", name)
+		}
 		description, err := fantasy.RenderText(option.Description)
 		if err != nil {
 			return decisions.Question{}, invalidDecisionArgument("option %q: %v", option.Name, err)
@@ -254,11 +273,12 @@ func noulQuestion(q fantasy.NoulQuestion) (decisions.Question, error) {
 	return decisions.NewQuestion(noul), nil
 }
 
-func (m *decisionModel) toResponse(questions map[string]fantasy.Question, result *decisions.CreateDecisionResponse) (*fantasy.DecisionResponse, error) {
-	if result == nil {
+func (m *decisionModel) toResponse(call fantasy.DecisionCall, result *operations.CreateDecisionResponse) (*fantasy.DecisionResponse, error) {
+	body := result.CreateDecisionResponse
+	if body == nil {
 		return nil, invalidDecisionResponse("the response was empty")
 	}
-	if feedback := result.PromptFeedback; feedback != nil && feedback.BlockReason != nil && *feedback.BlockReason != "" {
+	if feedback := body.PromptFeedback; feedback != nil && feedback.BlockReason != nil && *feedback.BlockReason != "" {
 		message := string(*feedback.BlockReason)
 		if feedback.BlockReasonMessage != nil && *feedback.BlockReasonMessage != "" {
 			message += ": " + *feedback.BlockReasonMessage
@@ -266,62 +286,119 @@ func (m *decisionModel) toResponse(questions map[string]fantasy.Question, result
 		return nil, &fantasy.Error{Title: "content blocked", Message: message}
 	}
 
-	answers := make(map[string]fantasy.Answer, len(questions))
-	for _, name := range slices.Sorted(maps.Keys(questions)) {
-		raw, ok := result.Answers[name]
+	// NOTE: The SDK flattens missing numbers to zero and collapses duplicate keys. Its retained response body preserves both distinctions.
+	var wire struct {
+		Answers map[string]decisionAnswer `json:"answers"`
+	}
+	if err := json.UnmarshalRead(result.HTTPMeta.Response.Body, &wire); err != nil {
+		return nil, invalidDecisionResponse("could not decode answers: %v", err)
+	}
+	answers := make(map[string]fantasy.Answer, len(call.Questions))
+	for _, name := range slices.Sorted(maps.Keys(call.Questions)) {
+		raw, ok := wire.Answers[name]
 		if !ok {
 			return nil, invalidDecisionResponse("the response has no answer for question %q", name)
 		}
-		if raw.IsUnknown() {
-			return nil, invalidDecisionResponse("the answer to question %q has an unknown type", name)
-		}
-		answer, err := toAnswer(name, questions[name], raw)
+		answer, err := toAnswer(name, call.Questions[name], raw)
 		if err != nil {
 			return nil, err
 		}
 		answers[name] = answer
 	}
 
-	return &fantasy.DecisionResponse{
-		Model:   m.modelID,
-		Answers: answers,
-		Usage:   decisionUsage(result.Usage),
-	}, nil
+	response := &fantasy.DecisionResponse{Model: m.modelID, Answers: answers, Usage: decisionUsage(body.Usage)}
+	if _, ok := call.ProviderOptions[Name]; ok {
+		response.Warnings = []fantasy.CallWarning{{
+			Type:    fantasy.CallWarningTypeUnsupportedSetting,
+			Setting: "provider_options.google",
+			Message: "Gemini decision models do not support Google provider options",
+		}}
+	}
+	return response, nil
 }
 
-func toAnswer(name string, question fantasy.Question, raw decisions.Answer) (fantasy.Answer, error) {
-	switch q := question.(type) {
-	case fantasy.NoulQuestion:
-		if raw.NoulAnswer != nil {
-			return fantasy.NoulAnswer{
-				Probability: raw.NoulAnswer.Noul,
-				Confidence:  &raw.NoulAnswer.Confidence,
-			}, nil
-		}
-	case fantasy.ChoiceQuestion:
-		if raw.ChoiceAnswer != nil {
-			return fantasy.ChoiceAnswer{
-				Choice:        raw.ChoiceAnswer.Choice,
-				Probabilities: raw.ChoiceAnswer.Probabilities,
-				Confidence:    &raw.ChoiceAnswer.Confidence,
-			}, nil
-		}
-	case fantasy.ScoreQuestion:
-		if raw.ScoreAnswer != nil {
-			return toScoreAnswer(name, q, raw.ScoreAnswer)
+type decisionAnswer struct {
+	Type          fantasy.QuestionType `json:"type"`
+	Confidence    *float64             `json:"confidence"`
+	Noul          *float64             `json:"noul"`
+	Choice        string               `json:"choice"`
+	Score         *float64             `json:"score"`
+	Probabilities map[string]*float64  `json:"probabilities"`
+	Legend        map[string]string    `json:"legend"`
+}
+
+func validDecisionProbability(p *float64) bool {
+	return p != nil && *p >= 0 && *p <= 1
+}
+
+func toAnswer(name string, question fantasy.Question, raw decisionAnswer) (fantasy.Answer, error) {
+	switch raw.Type {
+	case fantasy.QuestionTypeNoul, fantasy.QuestionTypeChoice, fantasy.QuestionTypeScore:
+	default:
+		return nil, invalidDecisionResponse("the answer to question %q has an unknown type %q", name, raw.Type)
+	}
+	if raw.Type != question.GetType() {
+		return nil, invalidDecisionResponse("the answer to question %q is of type %q, want %q", name, raw.Type, question.GetType())
+	}
+	if !validDecisionProbability(raw.Confidence) {
+		return nil, invalidDecisionResponse("the answer to question %q has invalid confidence", name)
+	}
+	for key, probability := range raw.Probabilities {
+		if !validDecisionProbability(probability) {
+			return nil, invalidDecisionResponse("the answer to question %q has an invalid probability for %q", name, key)
 		}
 	}
-	return nil, invalidDecisionResponse("the answer to question %q is of type %q, want %q", name, raw.Type, question.GetType())
+	switch q := question.(type) {
+	case fantasy.NoulQuestion:
+		if !validDecisionProbability(raw.Noul) {
+			return nil, invalidDecisionResponse("the answer to question %q has an invalid noul probability", name)
+		}
+		return fantasy.NoulAnswer{Probability: *raw.Noul, Confidence: raw.Confidence}, nil
+	case fantasy.ChoiceQuestion:
+		options := make(map[string]bool, len(q.Options))
+		for _, opt := range q.Options {
+			options[opt.Name] = true
+		}
+		if !options[raw.Choice] {
+			return nil, invalidDecisionResponse("the answer to question %q chose unknown option %q", name, raw.Choice)
+		}
+		probabilities := make(map[string]float64, len(raw.Probabilities))
+		for key, probability := range raw.Probabilities {
+			if !options[key] {
+				return nil, invalidDecisionResponse("the answer to question %q has a probability for unknown option %q", name, key)
+			}
+			probabilities[key] = *probability
+		}
+		return fantasy.ChoiceAnswer{Choice: raw.Choice, Probabilities: probabilities, Confidence: raw.Confidence}, nil
+	case fantasy.ScoreQuestion:
+		return toScoreAnswer(name, q, raw)
+	}
+	return nil, invalidDecisionResponse("the answer to question %q has an unsupported question type", name)
 }
 
-func toScoreAnswer(name string, question fantasy.ScoreQuestion, raw *decisions.ScoreAnswer) (fantasy.Answer, error) {
+func toScoreAnswer(name string, question fantasy.ScoreQuestion, raw decisionAnswer) (fantasy.Answer, error) {
+	if raw.Score == nil || !(*raw.Score >= 0 && *raw.Score <= float64(len(question.Levels)-1)) {
+		return nil, invalidDecisionResponse("the answer to question %q has an invalid score", name)
+	}
+	parseLevel := func(key string) (int, error) {
+		level, err := strconv.Atoi(key)
+		if err != nil || strconv.Itoa(level) != key || level < 0 || level >= len(question.Levels) {
+			return 0, invalidDecisionResponse("the answer to question %q has an invalid level %q", name, key)
+		}
+		return level, nil
+	}
 	probabilities := make(map[int]float64, len(raw.Probabilities))
 	for key, probability := range raw.Probabilities {
-		level, err := strconv.Atoi(key)
+		level, err := parseLevel(key)
 		if err != nil {
-			return nil, invalidDecisionResponse("the answer to question %q has the level %q, which is not a number", name, key)
+			return nil, err
 		}
-		probabilities[level] = probability
+		probabilities[level] = *probability
+	}
+	for key := range raw.Legend {
+		if _, err := parseLevel(key); err != nil {
+			return nil, err
+		}
 	}
 	// NOTE: The legend comes from the request, so labels are exactly what the caller wrote.
 	legend := make(map[int]string, len(question.Levels))
@@ -329,10 +406,10 @@ func toScoreAnswer(name string, question fantasy.ScoreQuestion, raw *decisions.S
 		legend[i] = level.Label
 	}
 	return fantasy.ScoreAnswer{
-		Score:         raw.Score,
+		Score:         *raw.Score,
 		Probabilities: probabilities,
 		Legend:        legend,
-		Confidence:    &raw.Confidence,
+		Confidence:    raw.Confidence,
 	}, nil
 }
 
@@ -346,12 +423,19 @@ func decisionUsage(usage *gi.Usage) fantasy.Usage {
 		}
 		return int64(*tokens)
 	}
-	// NOTE: Like the other Gemini models, the input tokens include the cached ones.
+	input := count(usage.TotalInputTokens)
+	output := count(usage.TotalOutputTokens)
+	total := count(usage.TotalTokens)
+	reasoning := count(usage.TotalThoughtTokens)
+	// NOTE: Gemini can report thoughts either inside or outside output. Only fold them in when the total accounts for them separately.
+	if reasoning > 0 && input+count(usage.TotalToolUseTokens)+output+reasoning == total {
+		output += reasoning
+	}
 	return fantasy.Usage{
-		InputTokens:     count(usage.TotalInputTokens),
-		OutputTokens:    count(usage.TotalOutputTokens),
-		TotalTokens:     count(usage.TotalTokens),
-		ReasoningTokens: count(usage.TotalThoughtTokens),
+		InputTokens:     input,
+		OutputTokens:    output,
+		TotalTokens:     total,
+		ReasoningTokens: reasoning,
 		CacheReadTokens: count(usage.TotalCachedTokens),
 	}
 }

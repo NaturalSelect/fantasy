@@ -128,9 +128,13 @@ call := fantasy.EmbeddingCall{
 
 ### Vertex
 
-- `DocumentOCR` and `AudioTrackExtraction` only work on Vertex. The Gemini API
-  backend rejects them before the request is sent.
-- The SDK sends a model whose ID has neither `gemini` nor `maas`, such as
-  `text-embedding-005`, to the `:predict` endpoint. It only reads the text of
-  the first part of each input there and drops the other parts without an error.
-- Models whose ID contains `maas` embed one input per request.
+- `DocumentOCR` and `AudioTrackExtraction` are sent on the Vertex `:embedContent`
+  and `:batchEmbedContents` routes. The Gemini Developer API rejects these
+  options before sending a request.
+- If the final segment of the model ID contains neither `gemini` nor `maas`
+  (case-sensitive), the SDK uses `:predict`, as for `text-embedding-005`.
+  This route uses only the text of the first part of each input. The response
+  warns about ignored later parts and about either option above if set.
+- A warning identifies each input the service reports as truncated. On
+  `:predict`, usage is empty unless statistics are available for every input.
+- Models whose final name segment contains `maas` embed one input per request.

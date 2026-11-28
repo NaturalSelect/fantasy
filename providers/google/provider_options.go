@@ -156,9 +156,11 @@ func (o *ProviderOptions) UnmarshalJSON(data []byte) error {
 // Fields marked Imagen only are ignored, with a warning, by Gemini image models.
 type ImageProviderOptions struct {
 	// ImageSize is the output resolution, e.g. "1K" or "2K".
-	ImageSize        *string `json:"image_size"`
+	ImageSize *string `json:"image_size"`
+	// NOTE: Person generation is configurable only on Vertex AI.
 	PersonGeneration *string `json:"person_generation"`
-	OutputMIMEType   *string `json:"output_mime_type"`
+	// NOTE: Only Vertex AI accepts an output MIME type.
+	OutputMIMEType *string `json:"output_mime_type"`
 
 	// Imagen only.
 	NegativePrompt    *string  `json:"negative_prompt"`
@@ -186,6 +188,14 @@ func (o *ImageProviderOptions) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// NOTE: A nil pointer must not become a non-nil options interface in the map.
+func NewImageProviderOptions(opts *ImageProviderOptions) fantasy.ProviderOptions {
+	if opts == nil {
+		return fantasy.ProviderOptions{}
+	}
+	return fantasy.ProviderOptions{Name: opts}
+}
+
 // Task types for EmbeddingProviderOptions.TaskType. Only gemini-embedding-001
 // takes them.
 const (
@@ -200,8 +210,8 @@ const (
 )
 
 // EmbeddingProviderOptions represents additional options for Google embeddings.
-// The service validates them, so a model that does not support an option
-// answers with an error.
+// NOTE: The Vertex :predict route ignores DocumentOCR and AudioTrackExtraction;
+// the response includes a warning for each of these options when set.
 type EmbeddingProviderOptions struct {
 	// TaskType is what the vectors are used for, see the TaskType constants.
 	// It only applies to gemini-embedding-001. gemini-embedding-2 rejects it,
@@ -241,9 +251,10 @@ func (o *EmbeddingProviderOptions) UnmarshalJSON(data []byte) error {
 
 // NewEmbeddingProviderOptions creates new embedding options for Google.
 func NewEmbeddingProviderOptions(opts *EmbeddingProviderOptions) fantasy.ProviderOptions {
-	return fantasy.ProviderOptions{
-		Name: opts,
+	if opts == nil {
+		return fantasy.ProviderOptions{}
 	}
+	return fantasy.ProviderOptions{Name: opts}
 }
 
 // ParseOptions parses provider options from a map for the Google provider.

@@ -5,7 +5,9 @@ import (
 	"cmp"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"charm.land/fantasy"
@@ -38,6 +40,9 @@ func (m imageModel) Provider() string {
 // Generate implements fantasy.ImageModel. It edits the reference images when
 // the call has any, and generates from the prompt alone otherwise.
 func (m imageModel) Generate(ctx context.Context, call fantasy.ImageCall) (*fantasy.ImageResponse, error) {
+	if err := call.Validate(); err != nil {
+		return nil, err
+	}
 	if call.Prompt == "" {
 		return nil, &fantasy.Error{Title: "invalid argument", Message: "image prompt is empty"}
 	}
@@ -62,15 +67,15 @@ func (m imageModel) Generate(ctx context.Context, call fantasy.ImageCall) (*fant
 }
 
 func imageProviderOptions(call fantasy.ImageCall) (*ImageProviderOptions, error) {
-	v, ok := call.ProviderOptions[Name]
-	if !ok {
+	v := call.ProviderOptions[Name]
+	if v == nil {
 		return &ImageProviderOptions{}, nil
 	}
 	options, ok := v.(*ImageProviderOptions)
 	if !ok {
 		return nil, &fantasy.Error{Title: "invalid argument", Message: "openai provider options should be *openai.ImageProviderOptions"}
 	}
-	return options, nil
+	return cmp.Or(options, &ImageProviderOptions{}), nil
 }
 
 func imageCallWarnings(call fantasy.ImageCall, options *ImageProviderOptions) []fantasy.CallWarning {
@@ -86,13 +91,6 @@ func imageCallWarnings(call fantasy.ImageCall, options *ImageProviderOptions) []
 		warnings = append(warnings, fantasy.CallWarning{
 			Type:    fantasy.CallWarningTypeUnsupportedSetting,
 			Setting: "seed",
-		})
-	}
-	if call.Mask != nil && len(call.Files) == 0 {
-		warnings = append(warnings, fantasy.CallWarning{
-			Type:    fantasy.CallWarningTypeUnsupportedSetting,
-			Setting: "mask",
-			Message: "a mask needs a reference image to edit",
 		})
 	}
 	if len(call.Files) > 0 {
@@ -211,18 +209,42 @@ func toImageUpload(file fantasy.FilePart) io.Reader {
 }
 
 func toImageResponse(response *openai.ImagesResponse, warnings []fantasy.CallWarning) (*fantasy.ImageResponse, error) {
-	mediaType := "image/" + cmp.Or(string(response.OutputFormat), "png")
+	if response == nil {
+		return nil, &fantasy.Error{Title: "invalid response", Message: "provider returned nil response"}
+	}
 
+	urlOnly := 0
 	images := make([]fantasy.FileContent, 0, len(response.Data))
 	for _, image := range response.Data {
 		if image.B64JSON == "" {
+			if image.URL != "" {
+				urlOnly++
+			}
 			continue
 		}
 		data, err := base64.StdEncoding.DecodeString(image.B64JSON)
 		if err != nil {
 			return nil, &fantasy.Error{Title: "invalid response", Message: "generated image is not valid base64", Cause: err}
 		}
+		var mediaType string
+		if response.OutputFormat != "" {
+			mediaType = "image/" + string(response.OutputFormat)
+		} else {
+			mediaType = http.DetectContentType(data)
+		}
 		images = append(images, fantasy.FileContent{MediaType: mediaType, Data: data})
+	}
+	if urlOnly > 0 {
+		if len(images) == 0 {
+			return nil, &fantasy.Error{
+				Title:   "invalid response",
+				Message: "images were returned as URLs, which this provider does not download; use a model or endpoint that returns b64_json",
+			}
+		}
+		warnings = append(warnings, fantasy.CallWarning{
+			Type:    fantasy.CallWarningTypeOther,
+			Message: fmt.Sprintf("URL-only images skipped: %d (this provider does not download URLs)", urlOnly),
+		})
 	}
 	if len(images) == 0 {
 		return nil, &fantasy.Error{Title: "no image generated", Message: "the response contained no image data"}

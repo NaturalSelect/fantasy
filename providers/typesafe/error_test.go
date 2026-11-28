@@ -1,9 +1,13 @@
 package typesafe
 
 import (
+	"context"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"charm.land/fantasy"
 	"github.com/stretchr/testify/require"
@@ -135,6 +139,106 @@ func TestDecide_Errors(t *testing.T) {
 			require.Equal(t, server.url+"/v1/systemone", providerErr.URL)
 			require.Equal(t, tt.body, string(providerErr.ResponseBody))
 			require.Equal(t, string(server.last(t).body), string(providerErr.RequestBody))
+		})
+	}
+}
+
+func modelWithClient(t *testing.T, do doFunc) fantasy.DecisionModel {
+	t.Helper()
+	p, err := New(WithHTTPClient(do))
+	require.NoError(t, err)
+	m, err := p.(fantasy.DecisionModelProvider).DecisionModel(t.Context(), "")
+	require.NoError(t, err)
+	return m
+}
+
+func TestDecide_ResponseBodyLimits(t *testing.T) {
+	t.Parallel()
+	const body = `{"answers":{"q":{"type":"noul","noul":0}}}`
+	for _, tt := range []struct {
+		name               string
+		status, size, read int
+	}{
+		{"error body", http.StatusTooManyRequests, (1 << 20) + 10, 1 << 20},
+		{"success at limit", http.StatusOK, 8 << 20, 8 << 20},
+		{"success above limit", http.StatusOK, (8 << 20) + 10, (8 << 20) + 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := strings.NewReader(body + strings.Repeat(" ", tt.size-len(body)))
+			model := modelWithClient(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tt.status, Body: io.NopCloser(r)}, nil
+			})
+			response, err := model.Decide(t.Context(), noulCall())
+			require.Equal(t, tt.read, tt.size-r.Len())
+			switch {
+			case tt.status != http.StatusOK:
+				var pe *fantasy.ProviderError
+				require.ErrorAs(t, err, &pe)
+				require.Equal(t, tt.status, pe.StatusCode)
+				require.Len(t, pe.ResponseBody, tt.read)
+			case tt.size > tt.read:
+				var invalid *fantasy.Error
+				require.ErrorAs(t, err, &invalid)
+				require.Equal(t, "invalid response", invalid.Title)
+				require.Contains(t, invalid.Message, "exceeds")
+			default:
+				require.NoError(t, err)
+				require.NotNil(t, response)
+			}
+		})
+	}
+}
+
+func TestDecide_PartialErrorBody(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusUnauthorized} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			model, _ := newTestModel(t, respond(status, "partial", "Content-Length", "1000", "Retry-After", "3"))
+			err := decideProviderErr(t, model, noulCall())
+			require.Equal(t, status, err.StatusCode)
+			require.Equal(t, "partial", string(err.ResponseBody))
+			require.Equal(t, "3", err.ResponseHeaders["retry-after"])
+			require.Equal(t, "3", err.ResponseHeaders["Retry-After"])
+			require.Equal(t, status == http.StatusTooManyRequests, err.IsRetryable())
+		})
+	}
+}
+
+func TestDecide_CanceledResponseBody(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusOK, http.StatusUnauthorized} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			model := modelWithClient(t, func(*http.Request) (*http.Response, error) {
+				cancel()
+				return &http.Response{StatusCode: status, Body: io.NopCloser(iotest.ErrReader(io.ErrUnexpectedEOF))}, nil
+			})
+			_, err := model.Decide(ctx, noulCall())
+			require.Equal(t, context.Canceled, err)
+		})
+	}
+}
+
+func TestDecide_ContextErrorMarker(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"422 question name", 422, `{"detail":[{"loc":["questions","max_tokens_exceeded"],"msg":"missing","type":"validation"}]}`, false},
+		{"wrong status", 429, `{"error":"max_tokens_exceeded"}`, false},
+		{"echoed input", 400, `{"detail":{"code":"invalid_state","input":"max_tokens_exceeded"}}`, false},
+		{"echoed input in error text", 400, `{"detail":"invalid question: max_tokens_exceeded"}`, false},
+		{"unrelated error", 400, `{"error":"not_max_tokens_exceeded"}`, false},
+		{"invalid json", 400, `{"error":"max_tokens_exceeded"`, false},
+		{"escaped error code", 400, `{"error":"max_tokens_\u0065xceeded"}`, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := toProviderErr(&http.Response{StatusCode: tt.status}, []byte(tt.body), "")
+			require.Equal(t, tt.want, err.IsContextTooLarge())
 		})
 	}
 }

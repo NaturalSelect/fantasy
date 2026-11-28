@@ -232,11 +232,17 @@ func (o *provider) Name() string {
 
 // ImageModel implements fantasy.ImageModelProvider.
 func (o *provider) ImageModel(_ context.Context, modelID string) (fantasy.ImageModel, error) {
+	if modelID == "" {
+		return nil, &fantasy.Error{Title: "invalid argument", Message: "image model ID is empty"}
+	}
 	return newImageModel(modelID, o.options.name, o.newClient()), nil
 }
 
 // EmbeddingModel implements fantasy.EmbeddingModelProvider.
 func (o *provider) EmbeddingModel(_ context.Context, modelID string) (fantasy.EmbeddingModel, error) {
+	if modelID == "" {
+		return nil, &fantasy.Error{Title: "invalid argument", Message: "embedding model ID is empty"}
+	}
 	return newEmbeddingModel(modelID, o.options.name, o.newClient()), nil
 }
 

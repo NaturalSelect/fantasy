@@ -15,7 +15,6 @@ type embeddingModel struct {
 	modelID  string
 	provider string
 	client   *genai.Client
-	backend  genai.Backend
 }
 
 var _ fantasy.EmbeddingModelProvider = (*provider)(nil)
@@ -29,11 +28,14 @@ var _ fantasy.EmbeddingModelProvider = (*provider)(nil)
 // parts of one input into one vector, and rejects a task type.
 // gemini-embedding-001 embeds text only and takes a task type.
 //
-// On Vertex AI the SDK sends models whose ID has neither "gemini" nor "maas",
-// such as text-embedding-005, to the :predict endpoint. For those it only reads
-// the text of the first part of each input and drops the other parts without an
-// error, and it fails on an input whose first part is a file.
+// NOTE: On Vertex AI the SDK sends models whose final name segment contains
+// neither "gemini" nor "maas" to :predict. It requires text in the first part
+// of each input. The response warns about ignored later parts and ignored
+// DocumentOCR and AudioTrackExtraction settings.
 func (a *provider) EmbeddingModel(ctx context.Context, modelID string) (fantasy.EmbeddingModel, error) {
+	if modelID == "" {
+		return nil, invalidEmbeddingArgument("embedding model ID is empty")
+	}
 	client, err := a.newClient(ctx)
 	if err != nil {
 		return nil, err
@@ -42,7 +44,6 @@ func (a *provider) EmbeddingModel(ctx context.Context, modelID string) (fantasy.
 		modelID:  modelID,
 		provider: a.options.name,
 		client:   client,
-		backend:  a.options.backend,
 	}, nil
 }
 
@@ -69,7 +70,8 @@ func (m *embeddingModel) Embed(ctx context.Context, call fantasy.EmbeddingCall) 
 	}
 	// NOTE: The SDK would fail these on the Gemini API backend with a plain
 	// error, which would not look like an invalid argument.
-	if m.backend != genai.BackendVertexAI {
+	backend := m.client.ClientConfig().Backend
+	if backend != genai.BackendVertexAI {
 		if options.DocumentOCR != nil {
 			return nil, invalidEmbeddingArgument("the document_ocr option needs the Vertex AI backend (google.WithVertex)")
 		}
@@ -106,7 +108,33 @@ func (m *embeddingModel) Embed(ctx context.Context, call fantasy.EmbeddingCall) 
 		return nil, toProviderErr(err)
 	}
 
-	return m.toEmbeddingResponse(response, len(contents))
+	result, err := m.toEmbeddingResponse(response, len(contents))
+	if err != nil {
+		return nil, err
+	}
+	if usesVertexPredict(backend, m.modelID) {
+		if options.DocumentOCR != nil {
+			result.Warnings = append(result.Warnings, unsupportedSettingWarning("document_ocr", "ignored by the Vertex :predict route"))
+		}
+		if options.AudioTrackExtraction != nil {
+			result.Warnings = append(result.Warnings, unsupportedSettingWarning("audio_track_extraction", "ignored by the Vertex :predict route"))
+		}
+		for i, input := range call.Inputs {
+			if len(input.Parts) > 1 {
+				result.Warnings = append(result.Warnings, fantasy.CallWarning{
+					Type:    fantasy.CallWarningTypeOther,
+					Message: fmt.Sprintf("input %d: the Vertex :predict route ignored all parts after the first", i),
+				})
+			}
+		}
+	}
+	return result, nil
+}
+
+func usesVertexPredict(backend genai.Backend, id string) bool {
+	// NOTE: Match genai's tIsVertexEmbedContentModel, including case sensitivity.
+	name := modelName(id)
+	return backend == genai.BackendVertexAI && !strings.Contains(name, "gemini") && !strings.Contains(name, "maas")
 }
 
 func embeddingProviderOptions(call fantasy.EmbeddingCall) (*EmbeddingProviderOptions, error) {
@@ -118,7 +146,7 @@ func embeddingProviderOptions(call fantasy.EmbeddingCall) (*EmbeddingProviderOpt
 	if !ok {
 		return nil, &fantasy.Error{Title: "invalid argument", Message: "google provider options should be *google.EmbeddingProviderOptions"}
 	}
-	return options, nil
+	return cmp.Or(options, &EmbeddingProviderOptions{}), nil
 }
 
 // embeddingContents turns every input into one content, so the service returns
@@ -165,7 +193,9 @@ func (m *embeddingModel) toEmbeddingResponse(response *genai.EmbedContentRespons
 	}
 
 	embeddings := make([][]float32, inputs)
+	var warnings []fantasy.CallWarning
 	var statisticsTokens int64
+	completeStatistics := true
 	for i, embedding := range response.Embeddings {
 		if embedding == nil {
 			return nil, invalidEmbeddingResponse("embedding %d is missing", i)
@@ -174,27 +204,33 @@ func (m *embeddingModel) toEmbeddingResponse(response *genai.EmbedContentRespons
 			return nil, invalidEmbeddingResponse("embedding %d is empty", i)
 		}
 		embeddings[i] = embedding.Values
-		if embedding.Statistics != nil {
-			statisticsTokens += int64(embedding.Statistics.TokenCount)
+		if embedding.Statistics == nil {
+			completeStatistics = false
+			continue
+		}
+		statisticsTokens += int64(embedding.Statistics.TokenCount)
+		if embedding.Statistics.Truncated {
+			warnings = append(warnings, fantasy.CallWarning{Type: fantasy.CallWarningTypeOther, Message: fmt.Sprintf("input %d was truncated by the service", i)})
 		}
 	}
 
-	// NOTE: Vertex models routed to :predict report no usage metadata, only the
-	// token count of every input, so the counts are summed. When the service
-	// reports neither, the usage stays empty instead of being estimated.
-	usage := fantasy.Usage{InputTokens: statisticsTokens, TotalTokens: statisticsTokens}
+	var usage fantasy.Usage
 	if metadata := response.UsageMetadata; metadata != nil {
 		usage = fantasy.Usage{
 			InputTokens: int64(metadata.PromptTokenCount),
 			TotalTokens: int64(cmp.Or(metadata.TotalTokenCount, metadata.PromptTokenCount)),
 		}
+	} else if completeStatistics {
+		// NOTE: Vertex :predict reports per-input counts, not a batch total.
+		usage = fantasy.Usage{InputTokens: statisticsTokens, TotalTokens: statisticsTokens}
 	}
 
 	return &fantasy.EmbeddingResponse{
 		Embeddings: embeddings,
 		// NOTE: The response carries no model, so this is the requested one.
-		Model: m.modelID,
-		Usage: usage,
+		Model:    m.modelID,
+		Usage:    usage,
+		Warnings: warnings,
 	}, nil
 }
 

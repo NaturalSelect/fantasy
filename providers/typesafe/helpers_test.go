@@ -18,6 +18,7 @@ import (
 type recordedRequest struct {
 	method string
 	path   string
+	query  string
 	header http.Header
 	body   []byte
 }
@@ -69,7 +70,7 @@ func newTestProvider(t *testing.T, handler http.HandlerFunc, opts ...Option) (fa
 	recorded := &testServer{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		recorded.add(recordedRequest{method: r.Method, path: r.URL.Path, header: r.Header.Clone(), body: body})
+		recorded.add(recordedRequest{method: r.Method, path: r.URL.Path, query: r.URL.RawQuery, header: r.Header.Clone(), body: body})
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		handler(w, r)
 	}))
@@ -108,7 +109,8 @@ func respond(status int, body string, headers ...string) http.HandlerFunc {
 func answerAll(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Questions map[string]struct {
-			Type string `json:"type"`
+			Type     string          `json:"type"`
+			Criteria json.RawMessage `json:"criteria"`
 		} `json:"questions"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&request)
@@ -119,9 +121,17 @@ func answerAll(w http.ResponseWriter, r *http.Request) {
 		case "noul":
 			answers[name] = map[string]any{"type": "noul", "noul": 0.5}
 		case "choice":
-			answers[name] = map[string]any{"type": "choice", "choice": "x"}
+			var options map[string]json.RawMessage
+			if err := json.Unmarshal(question.Criteria, &options); err != nil || len(options) == 0 {
+				http.Error(w, "invalid choice criteria", http.StatusBadRequest)
+				return
+			}
+			for option := range options {
+				answers[name] = map[string]any{"type": "choice", "choice": option, "probabilities": map[string]int{option: 1}}
+				break
+			}
 		case "score":
-			answers[name] = map[string]any{"type": "score", "score": 0}
+			answers[name] = map[string]any{"type": "score", "score": 0, "probabilities": map[string]int{"0": 1}}
 		case "box":
 			answers[name] = map[string]any{"type": "box", "box": map[string]any{"top": 0, "bottom": 1, "left": 0, "right": 1}}
 		}

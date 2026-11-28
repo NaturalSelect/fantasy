@@ -46,8 +46,8 @@ fmt.Println(tone.Choice, tone.Probabilities)
 
 ## Behaviour to know
 
-- **Noul has no confidence.** `NoulAnswer.Confidence` is nil. Choice, Score and
-  Box answers carry one.
+- **Noul has no confidence.** `NoulAnswer.Confidence` is always nil. Choice,
+  Score and Box confidence may also be absent; check for nil before use.
 - **Choice order matters.** Options are sent in the order you give them, and
   TypeSafe leans toward the first option.
 - **Limits.** A choice question has 1 to 255 options and a score question has 1
@@ -75,6 +75,12 @@ Gemini Decisions API. The core types are the same, but the providers differ.
 | Box questions | yes | no, returns an unsupported error |
 | Blocked content | not reported | returns a content blocked error |
 | Backend | `api.typesafe.ai` | Gemini Developer API only, not Vertex AI |
+
+## HTTP client
+
+`WithHTTPClient` accepts any `typesafe.HTTPClient` implementing
+`Do(*http.Request) (*http.Response, error)`, including `*http.Client`.
+If none is configured, the provider uses `http.DefaultClient`.
 
 ## Long context
 

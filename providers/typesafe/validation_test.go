@@ -69,7 +69,7 @@ func TestDecide_ValidationBeforeSending(t *testing.T) {
 		{
 			name:      "pointer to a core question type",
 			call:      textCall(map[string]fantasy.Question{"odd": &fantasy.NoulQuestion{}}),
-			wantTitle: "unsupported",
+			wantTitle: "invalid argument",
 			want:      `question "odd"`,
 		},
 		{

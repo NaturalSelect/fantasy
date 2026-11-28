@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 )
@@ -13,6 +14,7 @@ import (
 // Text is descriptive text sent to a decision model, such as instructions or
 // an option description. Use String for plain text, or any type that can
 // render itself as text.
+// NOTE: DecisionText must be deterministic because it may be called more than once per decision call.
 type Text interface {
 	DecisionText() (string, error)
 }
@@ -51,10 +53,15 @@ func (j jsonText) DecisionText() (string, error) {
 
 // RenderText returns the string form of t. A nil t renders as "".
 func RenderText(t Text) (string, error) {
-	if t == nil {
+	if nilOrNilPointer(t) {
 		return "", nil
 	}
 	return t.DecisionText()
+}
+
+func nilOrNilPointer(v any) bool {
+	rv := reflect.ValueOf(v)
+	return v == nil || (rv.Kind() == reflect.Pointer && rv.IsNil())
 }
 
 // QuestionType identifies the kind of a decision question or answer.
@@ -149,28 +156,31 @@ type DecisionCall struct {
 // does not know are left for the provider to accept or reject.
 func (c DecisionCall) Validate() error {
 	if len(c.Input) == 0 {
-		return invalidDecisionCall("input must have at least one part")
+		return invalidArgument("input must have at least one part")
 	}
 	for i, part := range c.Input {
 		if err := validateDecisionInputPart(part); err != nil {
-			return invalidDecisionCall("input part %d: %v", i, err)
+			return invalidArgument("input part %d: %v", i, err)
 		}
 	}
 	if len(c.Questions) == 0 {
-		return invalidDecisionCall("at least one question is required")
+		return invalidArgument("at least one question is required")
 	}
 	for _, name := range slices.Sorted(maps.Keys(c.Questions)) {
 		if name == "" {
-			return invalidDecisionCall("question names must not be empty")
+			return invalidArgument("question names must not be empty")
 		}
 		if err := validateQuestion(c.Questions[name]); err != nil {
-			return invalidDecisionCall("question %q: %v", name, err)
+			return invalidArgument("question %q: %v", name, err)
 		}
 	}
 	return nil
 }
 
 func validateDecisionInputPart(part MessagePart) error {
+	if nilOrNilPointer(part) {
+		return errors.New("part is nil")
+	}
 	if _, ok := AsMessagePart[TextPart](part); ok {
 		return nil
 	}
@@ -183,9 +193,6 @@ func validateDecisionInputPart(part MessagePart) error {
 		}
 		return nil
 	}
-	if part == nil {
-		return errors.New("part is nil")
-	}
 	return fmt.Errorf("unsupported part type %q, use text or image files", part.GetType())
 }
 
@@ -193,6 +200,12 @@ func validateQuestion(question Question) error {
 	switch q := question.(type) {
 	case nil:
 		return errors.New("question is nil")
+	case *NoulQuestion:
+		return errors.New("pass NoulQuestion by value, not a pointer")
+	case *ChoiceQuestion:
+		return errors.New("pass ChoiceQuestion by value, not a pointer")
+	case *ScoreQuestion:
+		return errors.New("pass ScoreQuestion by value, not a pointer")
 	case NoulQuestion:
 		return validateTexts(q.Instructions, q.TrueDescription, q.FalseDescription)
 	case ChoiceQuestion:
@@ -252,10 +265,6 @@ func validateTexts(texts ...Text) error {
 		}
 	}
 	return nil
-}
-
-func invalidDecisionCall(format string, args ...any) error {
-	return &Error{Title: "invalid argument", Message: fmt.Sprintf(format, args...)}
 }
 
 // RenderScoreLevel renders a level as "Label: Description", or just the label
@@ -362,7 +371,7 @@ func (r *DecisionResponse) Refused(name string) bool {
 // provider-specific one.
 func AsAnswer[T Answer](answer Answer) (T, bool) {
 	var zero T
-	if answer == nil {
+	if nilOrNilPointer(answer) {
 		return zero, false
 	}
 	switch v := any(answer).(type) {

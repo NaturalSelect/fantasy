@@ -9,42 +9,46 @@ import (
 	"strings"
 
 	"charm.land/fantasy"
+	"charm.land/fantasy/providers/internal/httpheaders"
 )
 
 // toProviderErr converts a non-2xx response into a ProviderError. A body with
 // a "detail" field, documented for 400 and 422, is summarised, and any other
 // body is reported as it came.
 func toProviderErr(resp *http.Response, body []byte, requestURL string) *fantasy.ProviderError {
-	message, errorType := parseErrorBody(resp, body)
+	message, errorType, maxTokens := parseErrorBody(resp, body)
 	return &fantasy.ProviderError{
-		Title:           cmp.Or(fantasy.ErrorTitleForStatusCode(resp.StatusCode), "provider request failed"),
-		Message:         message,
-		URL:             requestURL,
-		StatusCode:      resp.StatusCode,
-		ResponseHeaders: toHeaderMap(resp.Header),
-		ResponseBody:    body,
-		ErrorType:       errorType,
-		// NOTE: The docs mention max_tokens_exceeded without saying where it
-		// appears in the body, so match the raw body.
-		ContextTooLargeErr: bytes.Contains(body, []byte("max_tokens_exceeded")),
+		Title:              cmp.Or(fantasy.ErrorTitleForStatusCode(resp.StatusCode), "provider request failed"),
+		Message:            message,
+		URL:                requestURL,
+		StatusCode:         resp.StatusCode,
+		ResponseHeaders:    httpheaders.ResponseHeaders(resp.Header),
+		ResponseBody:       body,
+		ErrorType:          errorType,
+		ContextTooLargeErr: resp.StatusCode == http.StatusBadRequest && maxTokens,
 	}
 }
 
-func parseErrorBody(resp *http.Response, body []byte) (message, errorType string) {
+func parseErrorBody(resp *http.Response, body []byte) (message, errorType string, maxTokens bool) {
+	const code = "max_tokens_exceeded"
 	var envelope struct {
 		Detail json.RawMessage `json:"detail"`
+		Error  json.RawMessage `json:"error"`
 	}
 	if json.Unmarshal(body, &envelope) == nil {
+		var errorCode string
+		maxTokens = json.Unmarshal(envelope.Error, &errorCode) == nil && errorCode == code
 		if detail := bytes.TrimSpace(envelope.Detail); len(detail) > 0 {
 			switch detail[0] {
 			case '"':
 				var text string
 				if json.Unmarshal(detail, &text) == nil {
-					return text, ""
+					kind, _, _ := strings.Cut(text, ":")
+					return text, "", maxTokens || kind == code
 				}
 			case '[':
 				if msg, typ, ok := validationIssues(detail); ok {
-					return msg, typ
+					return msg, typ, maxTokens
 				}
 			case '{':
 				var object struct {
@@ -52,14 +56,15 @@ func parseErrorBody(resp *http.Response, body []byte) (message, errorType string
 					Type string `json:"type"`
 				}
 				_ = json.Unmarshal(detail, &object) // best-effort; the error type is only a hint.
-				return compactJSON(detail), cmp.Or(object.Code, object.Type)
+				kind := cmp.Or(object.Code, object.Type)
+				return compactJSON(detail), kind, maxTokens || kind == code
 			}
 		}
 	}
 	if text := strings.TrimSpace(string(body)); text != "" {
-		return text, ""
+		return text, "", maxTokens
 	}
-	return cmp.Or(http.StatusText(resp.StatusCode), resp.Status), ""
+	return cmp.Or(http.StatusText(resp.StatusCode), resp.Status), "", maxTokens
 }
 
 // validationIssues formats the "detail" list of a 422 response as
@@ -94,15 +99,4 @@ func compactJSON(data []byte) string {
 		return string(data)
 	}
 	return out.String()
-}
-
-func toHeaderMap(in http.Header) (out map[string]string) {
-	out = make(map[string]string, len(in)*2)
-	for k, v := range in {
-		if l := len(v); l > 0 {
-			out[k] = v[l-1]
-			out[strings.ToLower(k)] = v[l-1]
-		}
-	}
-	return out
 }

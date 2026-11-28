@@ -59,6 +59,9 @@ func (o *DecisionProviderOptions) UnmarshalJSON(data []byte) error {
 
 // NewDecisionProviderOptions creates new decision options for TypeSafe.
 func NewDecisionProviderOptions(opts *DecisionProviderOptions) fantasy.ProviderOptions {
+	if opts == nil {
+		return fantasy.ProviderOptions{}
+	}
 	return fantasy.ProviderOptions{
 		Name: opts,
 	}

@@ -3,6 +3,7 @@ package httpheaders
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -46,6 +47,20 @@ func ResolveHeaders(headers map[string]string, explicitUA, defaultUA string) map
 		out["User-Agent"] = defaultUA
 	}
 
+	return out
+}
+
+// ResponseHeaders flattens response headers into a map that keeps the last
+// value of each header under its original and its lowercase key. The lowercase
+// key is what the retry logic reads.
+func ResponseHeaders(in http.Header) map[string]string {
+	out := make(map[string]string, len(in)*2)
+	for k, v := range in {
+		if l := len(v); l > 0 {
+			out[k] = v[l-1]
+			out[strings.ToLower(k)] = v[l-1]
+		}
+	}
 	return out
 }
 

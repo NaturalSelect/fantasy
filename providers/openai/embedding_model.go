@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"math"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/openai-go"
@@ -36,8 +37,9 @@ func (m embeddingModel) Provider() string {
 	return m.provider
 }
 
-// Embed implements fantasy.EmbeddingModel. Every input must be a single text
-// part, and the request is sent once without retries.
+// NOTE: callers choose batch boundaries and retry policy. Embed does not split
+// batches, and SDK retries are disabled by default. Negotiating request
+// compression can still resend a batch.
 func (m embeddingModel) Embed(ctx context.Context, call fantasy.EmbeddingCall) (*fantasy.EmbeddingResponse, error) {
 	if err := call.Validate(); err != nil {
 		return nil, err
@@ -66,15 +68,15 @@ func (m embeddingModel) Embed(ctx context.Context, call fantasy.EmbeddingCall) (
 }
 
 func embeddingProviderOptions(call fantasy.EmbeddingCall) (*EmbeddingProviderOptions, error) {
-	v, ok := call.ProviderOptions[Name]
-	if !ok {
+	v := call.ProviderOptions[Name]
+	if v == nil {
 		return &EmbeddingProviderOptions{}, nil
 	}
 	options, ok := v.(*EmbeddingProviderOptions)
 	if !ok {
 		return nil, &fantasy.Error{Title: "invalid argument", Message: "openai provider options should be *openai.EmbeddingProviderOptions"}
 	}
-	return options, nil
+	return cmp.Or(options, &EmbeddingProviderOptions{}), nil
 }
 
 // NOTE: the endpoint takes plain strings, so there is no way to carry a file or
@@ -118,29 +120,45 @@ func (m embeddingModel) params(call fantasy.EmbeddingCall, texts []string, optio
 	return params
 }
 
-// NOTE: the API tags every vector with the index of its input and does not
-// promise to return them in order, so the array order is not trusted.
 func (m embeddingModel) toEmbeddingResponse(response *openai.CreateEmbeddingResponse, inputs int) (*fantasy.EmbeddingResponse, error) {
+	if response == nil {
+		return nil, invalidEmbeddingResponse("provider returned nil response")
+	}
 	if len(response.Data) != inputs {
 		return nil, invalidEmbeddingResponse("expected %d embeddings, got %d", inputs, len(response.Data))
 	}
 
 	embeddings := make([][]float32, inputs)
-	for _, item := range response.Data {
-		if item.Index < 0 || item.Index >= int64(inputs) {
-			return nil, invalidEmbeddingResponse("embedding index %d is out of range for %d inputs", item.Index, inputs)
+	for pos, item := range response.Data {
+		field := item.JSON.Index
+		if field.Valid() != response.Data[0].JSON.Index.Valid() {
+			return nil, invalidEmbeddingResponse("only some embeddings have an index")
 		}
-		if embeddings[item.Index] != nil {
-			return nil, invalidEmbeddingResponse("embedding index %d appears more than once", item.Index)
+		index := item.Index
+		if !field.Valid() {
+			if raw := field.Raw(); raw != "" && raw != "null" {
+				return nil, invalidEmbeddingResponse("embedding %d has an invalid index", pos)
+			}
+			// NOTE: some compatible backends omit every index and return vectors in input order.
+			index = int64(pos)
+		}
+		if index < 0 || index >= int64(inputs) {
+			return nil, invalidEmbeddingResponse("embedding index %d is out of range for %d inputs", index, inputs)
+		}
+		if embeddings[index] != nil {
+			return nil, invalidEmbeddingResponse("embedding index %d appears more than once", index)
 		}
 		if len(item.Embedding) == 0 {
-			return nil, invalidEmbeddingResponse("embedding %d is empty", item.Index)
+			return nil, invalidEmbeddingResponse("embedding %d is empty", index)
 		}
 		vector := make([]float32, len(item.Embedding))
 		for i, value := range item.Embedding {
 			vector[i] = float32(value)
+			if v := float64(vector[i]); math.IsInf(v, 0) || math.IsNaN(v) {
+				return nil, invalidEmbeddingResponse("embedding %d value %d is not finite as float32", index, i)
+			}
 		}
-		embeddings[item.Index] = vector
+		embeddings[index] = vector
 	}
 
 	return &fantasy.EmbeddingResponse{

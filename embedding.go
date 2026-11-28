@@ -51,25 +51,28 @@ type EmbeddingCall struct {
 // differ between providers and models are left to the provider and the service.
 func (c EmbeddingCall) Validate() error {
 	if len(c.Inputs) == 0 {
-		return invalidEmbeddingCall("at least one input is required")
+		return invalidArgument("at least one input is required")
 	}
 	for i, input := range c.Inputs {
 		if len(input.Parts) == 0 {
-			return invalidEmbeddingCall("input %d must have at least one part", i)
+			return invalidArgument("input %d must have at least one part", i)
 		}
 		for j, part := range input.Parts {
 			if err := validateEmbeddingPart(part); err != nil {
-				return invalidEmbeddingCall("input %d part %d: %v", i, j, err)
+				return invalidArgument("input %d part %d: %v", i, j, err)
 			}
 		}
 	}
 	if c.Dimensions != nil && *c.Dimensions <= 0 {
-		return invalidEmbeddingCall("dimensions must be greater than zero, got %d", *c.Dimensions)
+		return invalidArgument("dimensions must be greater than zero, got %d", *c.Dimensions)
 	}
 	return nil
 }
 
 func validateEmbeddingPart(part MessagePart) error {
+	if nilOrNilPointer(part) {
+		return errors.New("part is nil")
+	}
 	if text, ok := AsMessagePart[TextPart](part); ok {
 		if text.Text == "" {
 			return errors.New("text is empty")
@@ -85,14 +88,7 @@ func validateEmbeddingPart(part MessagePart) error {
 		}
 		return nil
 	}
-	if part == nil {
-		return errors.New("part is nil")
-	}
 	return fmt.Errorf("unsupported part type %q, use text or files", part.GetType())
-}
-
-func invalidEmbeddingCall(format string, args ...any) error {
-	return &Error{Title: "invalid argument", Message: fmt.Sprintf(format, args...)}
 }
 
 // EmbeddingResponse represents a response from an embedding model.

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,6 +14,8 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genai"
+	"google.golang.org/genai/interactions/models/apierrors"
 )
 
 type decisionRequest struct {
@@ -563,7 +566,7 @@ func TestDecisionModel_Response(t *testing.T) {
 		t.Parallel()
 
 		model, _ := newGeminiDecisionModel(t, http.StatusOK, decisionResponseBody(map[string]any{
-			"safe":   noulAnswerBody(0.97, 0.97),
+			"safe":   noulAnswerBody(0.03, 0.97),
 			"animal": choiceAnswerBody("cat", map[string]float64{"cat": 0.8, "dog": 0.2}, 0.8),
 			"quality": scoreAnswerBody(1.2, map[string]float64{"0": 0.1, "1": 0.6, "2": 0.3}, map[string]string{
 				"0": "the server's text for level 0",
@@ -597,7 +600,7 @@ func TestDecisionModel_Response(t *testing.T) {
 
 		noul, ok := response.Noul("safe")
 		require.True(t, ok)
-		require.InDelta(t, 0.97, noul.Probability, 1e-9)
+		require.InDelta(t, 0.03, noul.Probability, 1e-9)
 		require.NotNil(t, noul.Confidence)
 		require.InDelta(t, 0.97, *noul.Confidence, 1e-9)
 
@@ -634,7 +637,22 @@ func TestDecisionModel_Response(t *testing.T) {
 					"total_cached_tokens":  20,
 					"total_thought_tokens": 30,
 				},
-				want: fantasy.Usage{InputTokens: 100, OutputTokens: 0, TotalTokens: 130, ReasoningTokens: 30, CacheReadTokens: 20},
+				want: fantasy.Usage{InputTokens: 100, OutputTokens: 30, TotalTokens: 130, ReasoningTokens: 30, CacheReadTokens: 20},
+			},
+			{
+				name:  "output already includes thoughts",
+				usage: map[string]any{"total_input_tokens": 100, "total_output_tokens": 40, "total_thought_tokens": 30, "total_tokens": 140},
+				want:  fantasy.Usage{InputTokens: 100, OutputTokens: 40, ReasoningTokens: 30, TotalTokens: 140},
+			},
+			{
+				name:  "tool prompt counts in total when folding thoughts into output",
+				usage: map[string]any{"total_input_tokens": 100, "total_tool_use_tokens": 5, "total_output_tokens": 10, "total_thought_tokens": 30, "total_tokens": 145},
+				want:  fantasy.Usage{InputTokens: 100, OutputTokens: 40, ReasoningTokens: 30, TotalTokens: 145},
+			},
+			{
+				name:  "partial metadata uses the Developer API inclusive fallback",
+				usage: map[string]any{"total_output_tokens": 40, "total_thought_tokens": 30},
+				want:  fantasy.Usage{OutputTokens: 40, ReasoningTokens: 30},
 			},
 			{
 				name:  "missing fields count as zero",
@@ -722,6 +740,204 @@ func TestDecisionModel_Response(t *testing.T) {
 	})
 }
 
+func TestDecisionModel_InvalidAnswerValues(t *testing.T) {
+	t.Parallel()
+	noul := fantasy.NoulQuestion{Instructions: fantasy.String("Is it true?")}
+	choice := fantasy.ChoiceQuestion{Instructions: fantasy.String("Pick one"), Options: []fantasy.ChoiceOption{{Name: "cat"}, {Name: "dog"}}}
+	score := fantasy.ScoreQuestion{Instructions: fantasy.String("Rate it"), Levels: scoreLevels(2)}
+	for _, tc := range []struct {
+		name     string
+		question fantasy.Question
+		answer   any
+	}{
+		{"noul with only a discriminator", noul, map[string]any{"type": "noul"}},
+		{"missing noul", noul, map[string]any{"type": "noul", "confidence": 1}},
+		{"null noul", noul, map[string]any{"type": "noul", "confidence": 1, "noul": nil}},
+		{"missing confidence", noul, map[string]any{"type": "noul", "noul": 0}},
+		{"noul below zero", noul, noulAnswerBody(-0.1, 1)},
+		{"confidence above one", noul, noulAnswerBody(0.5, 1.01)},
+		{"confidence overflow", noul, json.RawMessage(`{"type":"noul","noul":0.5,"confidence":1e999}`)},
+		{"unknown choice winner", choice, choiceAnswerBody("bird", map[string]float64{"cat": 1}, 1)},
+		{"unknown choice key", choice, choiceAnswerBody("cat", map[string]float64{"bird": 1}, 1)},
+		{"choice probability above one", choice, choiceAnswerBody("cat", map[string]float64{"cat": 1.01}, 1)},
+		{"choice confidence below zero", choice, choiceAnswerBody("cat", map[string]float64{"cat": 1}, -0.1)},
+		{"score negative level", score, scoreAnswerBody(0, map[string]float64{"-1": 1}, nil, 1)},
+		{"score too high level", score, scoreAnswerBody(0, map[string]float64{"2": 1}, nil, 1)},
+		{"score noncanonical level", score, scoreAnswerBody(0, map[string]float64{"01": 1}, nil, 1)},
+		{"score overlapping levels", score, scoreAnswerBody(1, map[string]float64{"1": 0.5, "01": 0.5}, nil, 1)},
+		{"score noncanonical legend level", score, scoreAnswerBody(1, map[string]float64{"1": 1}, map[string]string{"01": "high"}, 1)},
+		{"score repeated identical key", score, json.RawMessage(`{"type":"score","score":1,"confidence":1,"probabilities":{"1":0.1,"1":0.9}}`)},
+		{"score probability below zero", score, scoreAnswerBody(0, map[string]float64{"0": -0.1}, nil, 1)},
+		{"null score probability", score, json.RawMessage(`{"type":"score","score":0,"confidence":1,"probabilities":{"0":null}}`)},
+		{"non-finite score probability", score, json.RawMessage(`{"type":"score","score":0,"confidence":1,"probabilities":{"0":"NaN"}}`)},
+		{"score confidence above one", score, scoreAnswerBody(0, map[string]float64{"0": 1}, nil, 1.1)},
+		{"score outside rubric", score, scoreAnswerBody(2, map[string]float64{"1": 1}, nil, 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			model, _ := newGeminiDecisionModel(t, http.StatusOK, decisionResponseBody(map[string]any{"q": tc.answer}, nil))
+			response, err := model.Decide(t.Context(), questionCall(map[string]fantasy.Question{"q": tc.question}))
+			require.Nil(t, response)
+			var target *fantasy.Error
+			require.ErrorAs(t, err, &target)
+			require.Equal(t, "invalid response", target.Title)
+		})
+	}
+}
+
+func TestDecisionModel_ExplicitZeroAndRoundedProbabilities(t *testing.T) {
+	t.Parallel()
+	model, _ := newGeminiDecisionModel(t, http.StatusOK, decisionResponseBody(map[string]any{
+		"blue":    noulAnswerBody(0, 0),
+		"quality": scoreAnswerBody(0.5, map[string]float64{"0": 0.51, "1": 0.5}, nil, 0.51),
+	}, nil))
+	call := blueCall()
+	call.Questions["quality"] = fantasy.ScoreQuestion{Instructions: fantasy.String("Rate it"), Levels: scoreLevels(2)}
+	response, err := model.Decide(t.Context(), call)
+	require.NoError(t, err)
+	answer, ok := response.Noul("blue")
+	require.True(t, ok)
+	require.Equal(t, fantasy.NoulAnswer{Probability: 0, Confidence: new(0.0)}, answer)
+	score, ok := response.Score("quality")
+	require.True(t, ok)
+	require.Equal(t, map[int]float64{0: 0.51, 1: 0.5}, score.Probabilities)
+}
+
+func TestDecisionModel_ProviderOptions(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		opts fantasy.ProviderOptions
+		warn bool
+	}{
+		{"other only", fantasy.ProviderOptions{"other": &ProviderOptions{}}, false},
+		{"Google and other", fantasy.ProviderOptions{Name: &ProviderOptions{}, "other": &ProviderOptions{}}, true},
+		{"Google key with nil value", fantasy.ProviderOptions{Name: nil}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			model, _ := newGeminiDecisionModel(t, http.StatusOK, blueResponseBody(), WithName("my-google"))
+			call := blueCall()
+			call.ProviderOptions = tc.opts
+			response, err := model.Decide(t.Context(), call)
+			require.NoError(t, err)
+			if !tc.warn {
+				require.Empty(t, response.Warnings)
+				return
+			}
+			require.Len(t, response.Warnings, 1)
+			warning := response.Warnings[0]
+			require.Equal(t, fantasy.CallWarningTypeUnsupportedSetting, warning.Type)
+			require.Equal(t, "provider_options.google", warning.Setting)
+			require.Contains(t, warning.Message, "do not support Google provider options")
+		})
+	}
+}
+
+func TestDecisionModel_ErrorHeaderValues(t *testing.T) {
+	t.Parallel()
+	err := toProviderErr(&apierrors.APIError{StatusCode: http.StatusTooManyRequests, RawResponse: &http.Response{
+		Header: http.Header{"Retry-After": {"3", "7"}, "X-Empty": {}},
+	}})
+	var providerErr *fantasy.ProviderError
+	require.ErrorAs(t, err, &providerErr)
+	require.Equal(t, map[string]string{"Retry-After": "7", "retry-after": "7"}, providerErr.ResponseHeaders)
+}
+
+func TestDecisionModel_BackendSelection(t *testing.T) {
+	for _, key := range []string{"GOOGLE_GENAI_USE_ENTERPRISE", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_API_VERSION", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_REGION", "GEMINI_API_KEY"} {
+		t.Setenv(key, "")
+		require.NoError(t, os.Unsetenv(key))
+	}
+	t.Setenv("GOOGLE_API_KEY", "env-key")
+	for _, tc := range []struct {
+		name                       string
+		vertex, enterprise         *string
+		explicitGemini, wantVertex bool
+	}{
+		{name: "explicit Gemini overrides environment Vertex", vertex: new("true"), explicitGemini: true},
+		{name: "only GOOGLE_API_KEY"},
+		{name: "Vertex from environment", vertex: new("TrUe"), wantVertex: true},
+		{name: "enterprise selects Vertex", enterprise: new("1"), wantVertex: true},
+		{name: "empty enterprise flag overrides Vertex", enterprise: new(""), vertex: new("true")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.vertex != nil {
+				t.Setenv("GOOGLE_GENAI_USE_VERTEXAI", *tc.vertex)
+			}
+			if tc.enterprise != nil {
+				t.Setenv("GOOGLE_GENAI_USE_ENTERPRISE", *tc.enterprise)
+			}
+			server, recorder := newDecisionTestServer(t, http.StatusOK, blueResponseBody())
+			opts := []Option{WithBaseURL(server.URL)}
+			wantKey := "env-key"
+			if tc.explicitGemini {
+				wantKey = "explicit-key"
+				opts = append(opts, WithGeminiAPIKey(wantKey))
+			}
+			p, err := New(opts...)
+			require.NoError(t, err)
+			model, err := p.(fantasy.DecisionModelProvider).DecisionModel(t.Context(), "")
+			if tc.wantVertex {
+				requireFantasyError(t, err, "unsupported", "Gemini Developer API")
+				require.Nil(t, model)
+				client, err := p.(*provider).newClient(t.Context())
+				require.NoError(t, err)
+				cfg := client.ClientConfig()
+				require.Equal(t, genai.BackendVertexAI, cfg.Backend)
+				require.Equal(t, "v1beta1", cfg.HTTPOptions.APIVersion)
+				require.Empty(t, recorder.requests())
+				return
+			}
+			require.NoError(t, err)
+			_, err = model.Decide(t.Context(), blueCall())
+			require.NoError(t, err)
+			request := recorder.only(t)
+			require.Equal(t, "/v1beta/decisions", request.path)
+			require.Equal(t, wantKey, request.header.Get("X-Goog-Api-Key"))
+		})
+	}
+}
+
+func TestDecisionModel_OptionNames(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, option string
+		valid        bool
+	}{
+		{"empty", "", false},
+		{"too many characters", strings.Repeat("a", 129), false},
+		{"too many bytes", strings.Repeat("\U00020000", 128) + "a", false},
+		{"leading space", " a", false},
+		{"trailing space", "a ", false},
+		{"newline", "a\nb", false},
+		{"non-whitespace control", "a\u007fb", false},
+		{"non-ASCII space", "a\u00a0b", false},
+		{"invalid UTF-8", "a\xff", false},
+		{"internal ASCII spaces", "é  b", true},
+		{"exactly 128 characters and 512 bytes", strings.Repeat("\U00020000", 128), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			model, recorder := newGeminiDecisionModel(t, http.StatusOK, decisionResponseBody(map[string]any{
+				"q": choiceAnswerBody(tc.option, map[string]float64{tc.option: 1}, 1),
+			}, nil))
+			response, err := model.Decide(t.Context(), questionCall(map[string]fantasy.Question{
+				"q": fantasy.ChoiceQuestion{Instructions: fantasy.String("Pick one"), Options: []fantasy.ChoiceOption{{Name: tc.option}, {Name: "other"}}},
+			}))
+			if tc.valid {
+				require.NoError(t, err)
+				criteria := recorder.only(t).body["questions"].(map[string]any)["q"].(map[string]any)["criteria"]
+				require.Contains(t, criteria, tc.option)
+				return
+			}
+			require.Empty(t, recorder.requests())
+			require.Nil(t, response)
+			requireFantasyError(t, err, "invalid argument", "option")
+		})
+	}
+}
+
 func TestDecisionModel_Vertex(t *testing.T) {
 	t.Parallel()
 
@@ -776,6 +992,18 @@ func TestDecisionModel_Validation(t *testing.T) {
 			message: "input must have at least one part",
 		},
 		{
+			name:    "empty single text input",
+			call:    withInput(fantasy.TextPart{}),
+			title:   "invalid argument",
+			message: "input part 0",
+		},
+		{
+			name:    "empty text in a multipart input",
+			call:    withInput(fantasy.TextPart{Text: "ok"}, &fantasy.TextPart{}),
+			title:   "invalid argument",
+			message: "input part 1",
+		},
+		{
 			name:    "custom question type",
 			call:    questionCall(map[string]fantasy.Question{"custom": customQuestion{}}),
 			title:   "unsupported",
@@ -786,7 +1014,7 @@ func TestDecisionModel_Validation(t *testing.T) {
 			call: questionCall(map[string]fantasy.Question{
 				"pointer": &fantasy.NoulQuestion{Instructions: fantasy.String("Is it true?")},
 			}),
-			title:   "unsupported",
+			title:   "invalid argument",
 			message: `question "pointer"`,
 		},
 		{

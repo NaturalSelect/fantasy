@@ -13,6 +13,7 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genai"
 )
 
 type embeddingRequest struct {
@@ -719,7 +720,7 @@ func TestEmbeddingModel_Vertex(t *testing.T) {
 		require.Nil(t, response.ProviderMetadata)
 	})
 
-	t.Run("should skip inputs without statistics when summing token counts", func(t *testing.T) {
+	t.Run("should leave usage empty when any input lacks statistics", func(t *testing.T) {
 		t.Parallel()
 
 		model, _ := newVertexEmbeddingModel(t, http.StatusOK,
@@ -729,7 +730,7 @@ func TestEmbeddingModel_Vertex(t *testing.T) {
 		response, err := model.Embed(t.Context(), fantasy.EmbeddingCall{Inputs: fantasy.TextEmbeddingInputs("a", "b")})
 		require.NoError(t, err)
 
-		require.Equal(t, fantasy.Usage{InputTokens: 5, TotalTokens: 5}, response.Usage)
+		require.Equal(t, fantasy.Usage{}, response.Usage)
 	})
 
 	t.Run("should leave usage empty when the predict response has no statistics", func(t *testing.T) {
@@ -765,22 +766,26 @@ func TestEmbeddingModel_Vertex(t *testing.T) {
 		require.EqualValues(t, 256, request.body["parameters"].(map[string]any)["outputDimensionality"])
 	})
 
-	t.Run("should not reject Vertex only options locally", func(t *testing.T) {
+	t.Run("should warn about each Vertex only option ignored by predict", func(t *testing.T) {
 		t.Parallel()
 
 		model, recorder := newVertexEmbeddingModel(t, http.StatusOK, vertexPredictResponse([]int{1}, []float32{1}), "text-embedding-005")
 
-		_, err := model.Embed(t.Context(), fantasy.EmbeddingCall{
+		response, err := model.Embed(t.Context(), fantasy.EmbeddingCall{
 			Inputs: fantasy.TextEmbeddingInputs("a"),
 			ProviderOptions: NewEmbeddingProviderOptions(&EmbeddingProviderOptions{
 				DocumentOCR:          new(true),
-				AudioTrackExtraction: new(true),
+				AudioTrackExtraction: new(false),
 			}),
 		})
 
 		require.NoError(t, err)
-		// NOTE: The SDK leaves these two options out of :predict requests.
-		require.Len(t, recorder.requests(), 1)
+		require.Equal(t, []string{"document_ocr", "audio_track_extraction"}, warningSettings(response.Warnings))
+		for _, warning := range response.Warnings {
+			require.Equal(t, fantasy.CallWarningTypeUnsupportedSetting, warning.Type)
+			require.Contains(t, warning.Message, ":predict")
+		}
+		require.Equal(t, map[string]any{"instances": []any{map[string]any{"content": "a"}}}, recorder.only(t).body)
 	})
 
 	t.Run("should send Vertex only options to gemini models", func(t *testing.T) {
@@ -815,6 +820,7 @@ func TestEmbeddingModel_Vertex(t *testing.T) {
 
 		require.Equal(t, [][]float32{{0.5, 0.25}}, response.Embeddings)
 		require.Equal(t, fantasy.Usage{InputTokens: 11, TotalTokens: 11}, response.Usage)
+		require.Empty(t, response.Warnings)
 	})
 
 	t.Run("should batch several inputs for gemini models", func(t *testing.T) {
@@ -878,9 +884,10 @@ func TestEmbeddingModel_Vertex(t *testing.T) {
 	t.Run("should only send the text of the first part to predict models", func(t *testing.T) {
 		t.Parallel()
 
-		model, recorder := newVertexEmbeddingModel(t, http.StatusOK, vertexPredictResponse(nil, []float32{1}), "text-embedding-005")
+		model, recorder := newVertexEmbeddingModel(t, http.StatusOK, vertexPredictResponse(nil, []float32{1}, []float32{2}), "text-embedding-005")
 
-		_, err := model.Embed(t.Context(), fantasy.EmbeddingCall{Inputs: []fantasy.EmbeddingInput{
+		response, err := model.Embed(t.Context(), fantasy.EmbeddingCall{Inputs: []fantasy.EmbeddingInput{
+			fantasy.TextEmbeddingInput("single"),
 			{Parts: []fantasy.MessagePart{
 				fantasy.TextPart{Text: "first part"},
 				fantasy.TextPart{Text: "second part"},
@@ -889,10 +896,11 @@ func TestEmbeddingModel_Vertex(t *testing.T) {
 		}})
 		require.NoError(t, err)
 
-		// NOTE: This is what the SDK does, not something this package chose. The
-		// other parts are dropped without an error, as the doc of EmbeddingModel says.
 		instances := recorder.only(t).body["instances"].([]any)
-		require.Equal(t, []any{map[string]any{"content": "first part"}}, instances)
+		require.Equal(t, []any{map[string]any{"content": "single"}, map[string]any{"content": "first part"}}, instances)
+		require.Len(t, response.Warnings, 1)
+		require.Contains(t, response.Warnings[0].Message, "input 1")
+		require.Contains(t, response.Warnings[0].Message, "after the first")
 	})
 
 	t.Run("should report service errors as provider errors", func(t *testing.T) {
@@ -907,6 +915,54 @@ func TestEmbeddingModel_Vertex(t *testing.T) {
 		require.ErrorAs(t, err, &providerErr)
 		require.True(t, providerErr.IsRetryable())
 	})
+}
+
+func TestEmbeddingModel_NilOptions(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, fantasy.ProviderOptions{}, NewEmbeddingProviderOptions(nil))
+	model, _ := newGeminiEmbeddingModel(t, http.StatusOK, geminiEmbeddingResponse(nil, []float32{1}), "gemini-embedding-2")
+	response, err := model.Embed(t.Context(), fantasy.EmbeddingCall{
+		Inputs: fantasy.TextEmbeddingInputs("a"), ProviderOptions: fantasy.ProviderOptions{Name: (*EmbeddingProviderOptions)(nil)},
+	})
+	require.NoError(t, err)
+	require.Len(t, response.Embeddings, 1)
+}
+
+func TestEmbeddingModel_PredictRoute(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		backend genai.Backend
+		id      string
+		predict bool
+	}{
+		{genai.BackendGeminiAPI, "text-embedding-005", false},
+		{genai.BackendVertexAI, "projects/gemini-maas/locations/x/publishers/google/models/text-embedding-005", true},
+		{genai.BackendVertexAI, "models/pre-gemini-post", false},
+		{genai.BackendVertexAI, "models/pre-maas-post", false},
+		{genai.BackendVertexAI, "models/Gemini-MAAS", true},
+	} {
+		t.Run(tc.id, func(t *testing.T) { require.Equal(t, tc.predict, usesVertexPredict(tc.backend, tc.id)) })
+	}
+}
+
+func TestEmbeddingModel_TruncatedInputs(t *testing.T) {
+	t.Parallel()
+	body := vertexPredictResponse([]int{5, 7, 9}, []float32{1}, []float32{2}, []float32{3})
+	predictions := body["predictions"].([]map[string]any)
+	for _, idx := range []int{0, 2} {
+		stats := predictions[idx]["embeddings"].(map[string]any)["statistics"].(map[string]any)
+		stats["truncated"] = true
+	}
+	model, _ := newVertexEmbeddingModel(t, http.StatusOK, body, "text-embedding-005")
+	response, err := model.Embed(t.Context(), fantasy.EmbeddingCall{Inputs: fantasy.TextEmbeddingInputs("a", "b", "c")})
+	require.NoError(t, err)
+	require.Equal(t, fantasy.Usage{InputTokens: 21, TotalTokens: 21}, response.Usage)
+	require.Len(t, response.Warnings, 2)
+	for i, label := range []string{"input 0", "input 2"} {
+		require.Equal(t, fantasy.CallWarningTypeOther, response.Warnings[i].Type)
+		require.Contains(t, response.Warnings[i].Message, label)
+		require.Contains(t, response.Warnings[i].Message, "truncated")
+	}
 }
 
 func TestEmbeddingProviderOptions_JSON(t *testing.T) {

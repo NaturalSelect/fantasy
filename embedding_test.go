@@ -137,6 +137,18 @@ func TestEmbeddingCall_Validate(t *testing.T) {
 	}
 }
 
+func TestEmbeddingCall_ValidateTypedNilPart(t *testing.T) {
+	t.Parallel()
+
+	for _, part := range []MessagePart{(*TextPart)(nil), (*FilePart)(nil)} {
+		call := validEmbeddingCall()
+		call.Inputs[1].Parts = append(call.Inputs[1].Parts, part)
+		var err error
+		require.NotPanics(t, func() { err = call.Validate() })
+		require.EqualError(t, err, "invalid argument: input 1 part 1: part is nil")
+	}
+}
+
 func TestEmbeddingResponse_JSONRoundTrip(t *testing.T) {
 	t.Parallel()
 

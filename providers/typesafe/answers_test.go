@@ -1,6 +1,7 @@
 package typesafe
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -93,7 +94,7 @@ func TestDecide_Answers(t *testing.T) {
 	t.Run("noul has no confidence", func(t *testing.T) {
 		t.Parallel()
 
-		model, _ := newTestModel(t, respond(http.StatusOK, `{"model":"jev-latest","answers":{"q":{"type":"noul","noul":0.98}}}`))
+		model, _ := newTestModel(t, respond(http.StatusOK, `{"model":"jev-latest","answers":{"q":{"type":"noul","noul":0.98,"confidence":0.7}}}`))
 		response, err := model.Decide(t.Context(), noulCall())
 		require.NoError(t, err)
 
@@ -183,8 +184,77 @@ func TestDecide_Answers(t *testing.T) {
 			`{"model":"m","answers":{"q":{"type":"noul","noul":0.1},"unasked":{"type":"noul","noul":0.9}}}`))
 		response, err := model.Decide(t.Context(), noulCall())
 		require.NoError(t, err)
-		require.Len(t, response.Answers, 1)
+		require.Equal(t, map[string]fantasy.Answer{"q": fantasy.NoulAnswer{Probability: 0.1}}, response.Answers)
 	})
+}
+
+func TestBoxEdges(t *testing.T) {
+	t.Parallel()
+
+	for _, edge := range []string{"top", "bottom", "left", "right"} {
+		for name, value := range map[string]string{"missing": "", "null": "null", "negative": "-0.1", "above one": "1.1", "overflow": "1e1000"} {
+			t.Run(edge+"/"+name, func(t *testing.T) {
+				edges := map[string]json.RawMessage{"top": []byte("1"), "bottom": []byte("0"), "left": []byte("1"), "right": []byte("0")}
+				if value == "" {
+					delete(edges, edge)
+				} else {
+					edges[edge] = []byte(value)
+				}
+				box, err := json.Marshal(edges)
+				require.NoError(t, err)
+				requireInvalidAnswer(t, BoxQuestion{}, `{"type":"box","box":`+string(box)+`}`)
+			})
+		}
+	}
+	answer, err := toAnswer("q", BoxQuestion{}, []byte(`{"type":"box","box":{"top":1,"bottom":0,"left":1,"right":0}}`))
+	require.NoError(t, err)
+	require.Equal(t, BoxAnswer{Top: 1, Left: 1}, answer)
+}
+
+func requireInvalidAnswer(t *testing.T, q fantasy.Question, answer string) {
+	t.Helper()
+	got, err := toAnswer("q", q, []byte(answer))
+	var invalid *fantasy.Error
+	require.ErrorAs(t, err, &invalid)
+	require.Equal(t, "invalid response", invalid.Title)
+	require.Nil(t, got)
+}
+
+func TestAnswerMatchesQuestion(t *testing.T) {
+	t.Parallel()
+	choice := fantasy.ChoiceQuestion{Options: []fantasy.ChoiceOption{{Name: "a"}, {Name: "b"}}}
+	score := fantasy.ScoreQuestion{Levels: []fantasy.ScoreLevel{{Label: "low"}, {Label: "high"}}}
+	for _, tt := range []struct {
+		name     string
+		question fantasy.Question
+		answer   string
+	}{
+		{"unknown winner", choice, `{"type":"choice","choice":"other","probabilities":{"a":1}}`},
+		{"unknown option", choice, `{"type":"choice","choice":"a","probabilities":{"other":1}}`},
+		{"null choice probability", choice, `{"type":"choice","choice":"a","probabilities":{"b":null}}`},
+		{"choice probability above one", choice, `{"type":"choice","choice":"a","probabilities":{"b":1.1}}`},
+		{"choice probability overflow", choice, `{"type":"choice","choice":"a","probabilities":{"b":1e1000}}`},
+		{"negative noul", fantasy.NoulQuestion{}, `{"type":"noul","noul":-0.1}`},
+		{"noul above one", fantasy.NoulQuestion{}, `{"type":"noul","noul":1.2}`},
+		{"noul overflow", fantasy.NoulQuestion{}, `{"type":"noul","noul":1e1000}`},
+		{"negative score", score, `{"type":"score","score":-0.1}`},
+		{"above highest score", score, `{"type":"score","score":1.1}`},
+		{"negative level", score, `{"type":"score","score":0,"probabilities":{"-1":0}}`},
+		{"level not requested", score, `{"type":"score","score":0,"probabilities":{"2":0}}`},
+		{"level alias", score, `{"type":"score","score":0,"probabilities":{"01":1,"1":0}}`},
+		{"unpaired level alias", score, `{"type":"score","score":0,"probabilities":{"+1":1}}`},
+		{"duplicate level", score, `{"type":"score","score":0,"probabilities":{"1":1,"1":0}}`},
+		{"null score probability", score, `{"type":"score","score":0,"probabilities":{"0":null}}`},
+		{"negative score probability", score, `{"type":"score","score":0,"probabilities":{"0":-0.1}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) { requireInvalidAnswer(t, tt.question, tt.answer) })
+	}
+	got, err := toAnswer("q", choice, []byte(`{"type":"choice","choice":"a","probabilities":{"a":0.8,"b":0.1}}`))
+	require.NoError(t, err)
+	require.Equal(t, fantasy.ChoiceAnswer{Choice: "a", Probabilities: map[string]float64{"a": 0.8, "b": 0.1}}, got)
+	got, err = toAnswer("q", score, []byte(`{"type":"score","score":0.5,"probabilities":{"0":1,"1":1}}`))
+	require.NoError(t, err)
+	require.Equal(t, fantasy.ScoreAnswer{Score: 0.5, Probabilities: map[int]float64{0: 1, 1: 1}, Legend: map[int]string{0: "low", 1: "high"}}, got)
 }
 
 func TestDecide_InvalidResponse(t *testing.T) {

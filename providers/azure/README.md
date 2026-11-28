@@ -11,6 +11,9 @@ The provider reuses the OpenAI implementation, so it also implements
 `fantasy.EmbeddingModelProvider`. Pass the name of your embedding deployment
 as the model ID. Azure deployments only accept text inputs.
 
+Always set the endpoint with `azure.WithBaseURL`. Without one the request goes
+to the OpenAI API, together with your Azure key and the input texts.
+
 OpenRouter, Vercel and the OpenAI-compatible provider are built the same way
 and expose the same method. Whether their backends serve `/embeddings` depends
 on the service, and a missing endpoint comes back as a 404 error.

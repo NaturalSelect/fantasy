@@ -301,6 +301,73 @@ func TestDecisionResponse_TypedAccessors(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestRenderText_TypedNil(t *testing.T) {
+	t.Parallel()
+
+	for _, text := range []Text{(*String)(nil), (*failingText)(nil)} {
+		var got string
+		var err error
+		require.NotPanics(t, func() { got, err = RenderText(text) })
+		require.NoError(t, err)
+		require.Equal(t, "", got)
+	}
+}
+
+func TestDecisionCall_ValidateTypedNilPart(t *testing.T) {
+	t.Parallel()
+
+	for _, part := range []MessagePart{(*TextPart)(nil), (*FilePart)(nil)} {
+		call := validDecisionCall()
+		call.Input = append(call.Input, part)
+		var err error
+		require.NotPanics(t, func() { err = call.Validate() })
+		require.EqualError(t, err, "invalid argument: input part 1: part is nil")
+	}
+}
+
+func TestDecisionCall_RejectsBuiltinQuestionPointers(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		pointers []Question
+	}{
+		{"NoulQuestion", []Question{&NoulQuestion{}, (*NoulQuestion)(nil)}},
+		{"ChoiceQuestion", []Question{&ChoiceQuestion{}, (*ChoiceQuestion)(nil)}},
+		{"ScoreQuestion", []Question{&ScoreQuestion{}, (*ScoreQuestion)(nil)}},
+	} {
+		for _, q := range tt.pointers {
+			call := validDecisionCall()
+			call.Questions["tone"] = q
+			require.EqualError(t, call.Validate(), `invalid argument: question "tone": pass `+tt.name+` by value, not a pointer`)
+		}
+	}
+}
+
+func TestDecisionResponse_TypedNilAnswers(t *testing.T) {
+	t.Parallel()
+
+	r := DecisionResponse{Answers: map[string]Answer{
+		"noul":    (*NoulAnswer)(nil),
+		"choice":  (*ChoiceAnswer)(nil),
+		"score":   (*ScoreAnswer)(nil),
+		"refusal": (*RefusalAnswer)(nil),
+	}}
+	for name := range r.Answers {
+		require.NotPanics(t, func() {
+			_, ok := r.Noul(name)
+			require.False(t, ok)
+			_, ok = r.Choice(name)
+			require.False(t, ok)
+			_, ok = r.Score(name)
+			require.False(t, ok)
+			require.False(t, r.Refused(name))
+		})
+	}
+	_, ok := AsAnswer[*NoulAnswer](r.Answers["noul"])
+	require.False(t, ok)
+}
+
 func TestAnswerAndQuestionTypes(t *testing.T) {
 	t.Parallel()
 

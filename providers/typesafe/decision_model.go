@@ -28,6 +28,9 @@ const (
 
 	maxChoiceOptions = 255
 	maxScoreLevels   = 10
+
+	maxErrorBodyBytes    = 1 << 20
+	maxResponseBodyBytes = 8 << 20
 )
 
 type decisionModel struct {
@@ -72,27 +75,41 @@ func (m *decisionModel) Decide(ctx context.Context, call fantasy.DecisionCall) (
 	}
 	httpResponse, err := m.options.client.Do(httpRequest)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, transportError(err)
 	}
 	defer httpResponse.Body.Close()
-	responseBody, err := io.ReadAll(httpResponse.Body)
-	if err != nil {
-		return nil, transportError(err)
-	}
 
 	if httpResponse.StatusCode < http.StatusOK || httpResponse.StatusCode >= http.StatusMultipleChoices {
+		// NOTE: Even an incomplete error body must not hide the status or retry headers.
+		responseBody, _ := io.ReadAll(io.LimitReader(httpResponse.Body, maxErrorBodyBytes))
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		providerErr := toProviderErr(httpResponse, responseBody, httpRequest.URL.String())
 		if !hasImages {
 			providerErr.RequestBody = body
 		}
 		return nil, providerErr
 	}
+	responseBody, err := io.ReadAll(io.LimitReader(httpResponse.Body, maxResponseBodyBytes+1))
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if len(responseBody) > maxResponseBodyBytes {
+		return nil, invalidResponsef("response body exceeds %d bytes", maxResponseBodyBytes)
+	}
+	if err != nil {
+		return nil, transportError(err)
+	}
 	return toDecisionResponse(call.Questions, responseBody, httpResponse.Header.Get(requestIDHeader))
 }
 
 func decisionProviderOptions(call fantasy.DecisionCall) (*DecisionProviderOptions, error) {
-	v, ok := call.ProviderOptions[Name]
-	if !ok {
+	v := call.ProviderOptions[Name]
+	if v == nil {
 		return &DecisionProviderOptions{}, nil
 	}
 	options, ok := v.(*DecisionProviderOptions)
@@ -106,12 +123,14 @@ func decisionProviderOptions(call fantasy.DecisionCall) (*DecisionProviderOption
 }
 
 func (m *decisionModel) newHTTPRequest(ctx context.Context, call fantasy.DecisionCall, options *DecisionProviderOptions, body []byte, hasImages bool) (*http.Request, error) {
-	url := strings.TrimSuffix(m.options.baseURL, "/") + decisionPath
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, m.options.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, &fantasy.Error{Title: "invalid argument", Message: "create request: " + err.Error(), Cause: err}
 	}
 
+	if m.options.apiKey != "" {
+		request.Header.Set("Authorization", "Bearer "+m.options.apiKey)
+	}
 	defaultUA := httpheaders.DefaultUserAgent(fantasy.Version)
 	for key, value := range httpheaders.ResolveHeaders(m.options.headers, m.options.userAgent, defaultUA) {
 		request.Header.Set(key, value)
@@ -125,9 +144,6 @@ func (m *decisionModel) newHTTPRequest(ctx context.Context, call fantasy.Decisio
 		}
 	}
 
-	if m.options.apiKey != "" {
-		request.Header.Set("Authorization", "Bearer "+m.options.apiKey)
-	}
 	request.Header.Set("Content-Type", "application/json")
 	// NOTE: A box question requires an image, so the images header is needed exactly when there are assets.
 	if hasImages {
@@ -371,9 +387,59 @@ type wireAnswer struct {
 	Choice        *string              `json:"choice"`
 	Score         *float64             `json:"score"`
 	Noul          *float64             `json:"noul"`
-	Box           *BoxAnswer           `json:"box"`
+	Box           *wireBox             `json:"box"`
 	Confidence    *float64             `json:"confidence"`
-	Probabilities map[string]float64   `json:"probabilities"`
+	Probabilities wireProbabilities    `json:"probabilities"`
+}
+
+type wireBox struct {
+	Top    *float64 `json:"top"`
+	Bottom *float64 `json:"bottom"`
+	Left   *float64 `json:"left"`
+	Right  *float64 `json:"right"`
+}
+
+func inRange(v *float64, max float64) bool {
+	return v != nil && *v >= 0 && *v <= max
+}
+
+type wireProbabilities map[string]float64
+
+func (p *wireProbabilities) UnmarshalJSON(data []byte) error {
+	// NOTE: Decoding straight into a map would silently discard duplicate levels.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	start, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if start == nil {
+		*p = nil
+		return nil
+	}
+	if start != json.Delim('{') {
+		return errors.New("expected an object of probabilities")
+	}
+	values := wireProbabilities{}
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key := token.(string)
+		if _, exists := values[key]; exists {
+			return fmt.Errorf("duplicate probability key %q", key)
+		}
+		var value *float64
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+		if !inRange(value, 1) {
+			return fmt.Errorf("probability for %q must be a number in [0, 1]", key)
+		}
+		values[key] = *value
+	}
+	*p = values
+	return nil
 }
 
 func toDecisionResponse(questions map[string]fantasy.Question, body []byte, requestID string) (*fantasy.DecisionResponse, error) {
@@ -424,21 +490,39 @@ func toAnswer(name string, question fantasy.Question, raw json.RawMessage) (fant
 		if wire.Noul == nil {
 			return nil, invalidResponsef("answer %q has no noul value", name)
 		}
-		return fantasy.NoulAnswer{Probability: *wire.Noul, Confidence: wire.Confidence}, nil
+		if !inRange(wire.Noul, 1) {
+			return nil, invalidResponsef("answer %q has noul outside [0, 1]", name)
+		}
+		return fantasy.NoulAnswer{Probability: *wire.Noul}, nil
 	case fantasy.ChoiceQuestion:
 		if wire.Choice == nil {
 			return nil, invalidResponsef("answer %q has no choice", name)
+		}
+		options := make(map[string]bool, len(q.Options))
+		for _, opt := range q.Options {
+			options[opt.Name] = true
+		}
+		if !options[*wire.Choice] {
+			return nil, invalidResponsef("answer %q has unknown choice %q", name, *wire.Choice)
+		}
+		for key := range wire.Probabilities {
+			if !options[key] {
+				return nil, invalidResponsef("answer %q has probability for unknown choice %q", name, key)
+			}
 		}
 		return fantasy.ChoiceAnswer{Choice: *wire.Choice, Probabilities: wire.Probabilities, Confidence: wire.Confidence}, nil
 	case fantasy.ScoreQuestion:
 		if wire.Score == nil {
 			return nil, invalidResponsef("answer %q has no score", name)
 		}
+		if !inRange(wire.Score, float64(len(q.Levels)-1)) {
+			return nil, invalidResponsef("answer %q has score outside the requested levels", name)
+		}
 		probabilities := make(map[int]float64, len(wire.Probabilities))
 		for key, probability := range wire.Probabilities {
 			level, err := strconv.Atoi(key)
-			if err != nil {
-				return nil, invalidResponsef("answer %q has probability for level %q, expected a level number", name, key)
+			if err != nil || strconv.Itoa(level) != key || level < 0 || level >= len(q.Levels) {
+				return nil, invalidResponsef("answer %q has invalid probability level %q", name, key)
 			}
 			probabilities[level] = probability
 		}
@@ -451,9 +535,14 @@ func toAnswer(name string, question fantasy.Question, raw json.RawMessage) (fant
 		if wire.Box == nil {
 			return nil, invalidResponsef("answer %q has no box", name)
 		}
-		box := *wire.Box
-		box.Confidence = wire.Confidence
-		return box, nil
+		box := wire.Box
+		if !inRange(box.Top, 1) || !inRange(box.Bottom, 1) || !inRange(box.Left, 1) || !inRange(box.Right, 1) {
+			return nil, invalidResponsef("answer %q must have four box edges in [0, 1]", name)
+		}
+		return BoxAnswer{
+			Top: *box.Top, Bottom: *box.Bottom, Left: *box.Left, Right: *box.Right,
+			Confidence: wire.Confidence,
+		}, nil
 	default:
 		return nil, &fantasy.Error{Title: "unsupported", Message: fmt.Sprintf("question %q: %T is not supported by typesafe", name, question)}
 	}

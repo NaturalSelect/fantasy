@@ -12,6 +12,7 @@ import (
 	"context"
 	"maps"
 	"net/http"
+	"net/url"
 
 	"charm.land/fantasy"
 )
@@ -30,13 +31,18 @@ type provider struct {
 	options options
 }
 
+type HTTPClient interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
 type options struct {
 	apiKey    string
 	baseURL   string
+	endpoint  string
 	name      string
 	headers   map[string]string
 	userAgent string
-	client    *http.Client
+	client    HTTPClient
 }
 
 // Option defines a function that configures TypeSafe provider options.
@@ -47,15 +53,20 @@ var _ fantasy.DecisionModelProvider = (*provider)(nil)
 // New creates a new TypeSafe provider with the given options.
 func New(opts ...Option) (fantasy.Provider, error) {
 	providerOptions := options{
+		baseURL: DefaultURL,
 		headers: map[string]string{},
 	}
 	for _, o := range opts {
 		o(&providerOptions)
 	}
 
-	providerOptions.baseURL = cmp.Or(providerOptions.baseURL, DefaultURL)
+	base, err := url.Parse(providerOptions.baseURL)
+	if err != nil || (base.Scheme != "https" && base.Scheme != "http") || base.Hostname() == "" {
+		return nil, invalidArgumentf("base URL must be an absolute HTTP or HTTPS URL")
+	}
+	providerOptions.endpoint = base.JoinPath(decisionPath).String()
 	providerOptions.name = cmp.Or(providerOptions.name, Name)
-	providerOptions.client = cmp.Or(providerOptions.client, http.DefaultClient)
+	providerOptions.client = cmp.Or[HTTPClient](providerOptions.client, http.DefaultClient)
 
 	return &provider{options: providerOptions}, nil
 }
@@ -89,7 +100,11 @@ func WithHeaders(headers map[string]string) Option {
 }
 
 // WithHTTPClient sets the HTTP client for the TypeSafe provider.
-func WithHTTPClient(client *http.Client) Option {
+func WithHTTPClient(client HTTPClient) Option {
+	// NOTE: A nil *http.Client selected the default before this option accepted an interface.
+	if c, ok := client.(*http.Client); ok && c == nil {
+		client = nil
+	}
 	return func(o *options) {
 		o.client = client
 	}

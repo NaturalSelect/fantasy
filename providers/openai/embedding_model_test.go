@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
 	"charm.land/fantasy"
+	"github.com/charmbracelet/openai-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -55,13 +58,15 @@ func (s *embeddingServer) last(t *testing.T) embeddingRequest {
 func newEmbeddingTestProvider(t *testing.T, status int, response any, opts ...Option) (fantasy.EmbeddingModelProvider, *embeddingServer) {
 	t.Helper()
 
+	data, err := json.Marshal(response)
+	require.NoError(t, err)
 	recorder := &embeddingServer{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		recorder.record(embeddingRequest{path: r.URL.Path, header: r.Header.Clone(), body: body})
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(response)
+		_, _ = w.Write(data)
 	}))
 	t.Cleanup(server.Close)
 
@@ -189,6 +194,14 @@ func TestEmbeddingModel_Embed(t *testing.T) {
 		require.Equal(t, [][]float32{{1, 1}, {2, 2}, {3, 3}}, response.Embeddings)
 	})
 
+	t.Run("should use array order when all indexes are omitted or null", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newEmbeddingTestModel(t, json.RawMessage(`{"data":[{"embedding":[3]},{"index":null,"embedding":[1]}]}`))
+		response, err := model.Embed(t.Context(), fantasy.EmbeddingCall{Inputs: fantasy.TextEmbeddingInputs("a", "b")})
+		require.NoError(t, err)
+		require.Equal(t, [][]float32{{3}, {1}}, response.Embeddings)
+	})
+
 	t.Run("should fall back to the requested model when the response has none", func(t *testing.T) {
 		t.Parallel()
 
@@ -214,7 +227,7 @@ func TestEmbeddingModel_Embed(t *testing.T) {
 		require.Equal(t, []any{"pointer", "value"}, server.last(t).jsonBody(t)["input"])
 	})
 
-	t.Run("should accept the largest batch", func(t *testing.T) {
+	t.Run("should accept the largest batch without splitting it", func(t *testing.T) {
 		t.Parallel()
 
 		items := make([]embeddingItem, maxEmbeddingInputs)
@@ -242,6 +255,32 @@ func TestEmbeddingModel_Embed(t *testing.T) {
 
 		require.Equal(t, "custom", model.Provider())
 		require.Equal(t, "my-deployment", model.Model())
+	})
+}
+
+func TestEmbeddingModel_EmptyModelID(t *testing.T) {
+	t.Parallel()
+	p, _ := newEmbeddingTestProvider(t, http.StatusOK, nil)
+	model, err := p.EmbeddingModel(t.Context(), "")
+	var apiErr *fantasy.Error
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, "invalid argument", apiErr.Title)
+	require.Nil(t, model)
+}
+
+func TestEmbeddingModel_NilOptions(t *testing.T) {
+	t.Parallel()
+	t.Run("constructor", func(t *testing.T) {
+		require.Equal(t, fantasy.ProviderOptions{}, NewEmbeddingProviderOptions(nil))
+	})
+	t.Run("typed nil", func(t *testing.T) {
+		model, server := newEmbeddingTestModel(t, embeddingResponse("", embeddingItem{0, []float64{1}}))
+		_, err := model.Embed(t.Context(), fantasy.EmbeddingCall{
+			Inputs:          fantasy.TextEmbeddingInputs("text"),
+			ProviderOptions: fantasy.ProviderOptions{Name: (*EmbeddingProviderOptions)(nil)},
+		})
+		require.NoError(t, err)
+		require.NotContains(t, server.last(t).jsonBody(t), "user")
 	})
 }
 
@@ -342,9 +381,34 @@ func TestEmbeddingModel_Embed_InvalidResponses(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		response map[string]any
+		response any
 		message  string
 	}{
+		{
+			name:     "JSON null",
+			response: json.RawMessage(`null`),
+			message:  "nil response",
+		},
+		{
+			name:     "missing index mixed with explicit index",
+			response: json.RawMessage(`{"data":[{"embedding":[1]},{"index":1,"embedding":[2]}]}`),
+			message:  "only some embeddings have an index",
+		},
+		{
+			name:     "explicit index mixed with null index",
+			response: json.RawMessage(`{"data":[{"index":1,"embedding":[2]},{"index":null,"embedding":[1]}]}`),
+			message:  "only some embeddings have an index",
+		},
+		{
+			name:     "malformed index is not an omitted index",
+			response: json.RawMessage(`{"data":[{"index":{},"embedding":[2]},{"embedding":[1]}]}`),
+			message:  "invalid index",
+		},
+		{
+			name:     "vector value overflows float32",
+			response: embeddingResponse("", embeddingItem{0, []float64{1}}, embeddingItem{1, []float64{0, 1e40}}),
+			message:  "embedding 1 value 1 is not finite as float32",
+		},
 		{
 			name:     "fewer embeddings than inputs",
 			response: embeddingResponse("", embeddingItem{0, []float64{1}}),
@@ -424,7 +488,18 @@ func TestEmbeddingModel_Embed_InvalidResponses(t *testing.T) {
 	}
 }
 
-func TestEmbeddingModel_Embed_ProviderError(t *testing.T) {
+func TestEmbeddingModel_NaNVector(t *testing.T) {
+	t.Parallel()
+	_, err := (embeddingModel{}).toEmbeddingResponse(&openai.CreateEmbeddingResponse{
+		Data: []openai.Embedding{{Embedding: []float64{math.NaN()}}},
+	}, 1)
+	var apiErr *fantasy.Error
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, "invalid response", apiErr.Title)
+	require.Contains(t, apiErr.Message, "not finite as float32")
+}
+
+func TestEmbeddingModel_Embed_NoRetryByDefault(t *testing.T) {
 	t.Parallel()
 
 	embeddingProvider, server := newEmbeddingTestProvider(t, http.StatusTooManyRequests, map[string]any{
@@ -445,8 +520,28 @@ func TestEmbeddingModel_Embed_ProviderError(t *testing.T) {
 	require.Equal(t, http.StatusTooManyRequests, providerErr.StatusCode)
 	require.Contains(t, providerErr.Message, "Rate limit reached")
 	require.True(t, providerErr.IsRetryable())
-	// NOTE: retrying is the agent's job. The SDK client must not retry on its own.
 	require.Equal(t, 1, server.count())
+}
+
+func TestEmbeddingModel_Embed_CompressionFallback(t *testing.T) {
+	t.Parallel()
+	p, server := newEmbeddingTestProvider(t, http.StatusUnsupportedMediaType, map[string]any{
+		"error": map[string]string{"message": "unsupported media type"},
+	}, WithRequestCompression())
+	model, err := p.EmbeddingModel(t.Context(), "embed")
+	require.NoError(t, err)
+	text := strings.Repeat("hello", requestCompressionMinBytes)
+	_, err = model.Embed(t.Context(), fantasy.EmbeddingCall{Inputs: fantasy.TextEmbeddingInputs(text, "world")})
+	var providerErr *fantasy.ProviderError
+	require.ErrorAs(t, err, &providerErr)
+	require.Equal(t, http.StatusUnsupportedMediaType, providerErr.StatusCode)
+
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	require.Len(t, server.requests, 2)
+	require.Equal(t, "gzip", server.requests[0].header.Get("Content-Encoding"))
+	require.Empty(t, server.requests[1].header.Get("Content-Encoding"))
+	require.Equal(t, []any{text, "world"}, server.requests[1].jsonBody(t)["input"])
 }
 
 func TestEmbeddingModel_Embed_RequestOverrides(t *testing.T) {

@@ -82,6 +82,22 @@ func TestDecide_Headers(t *testing.T) {
 		require.Equal(t, "Bearer test-key", header.Get("Authorization"))
 	})
 
+	t.Run("explicit authorization overrides the API key", func(t *testing.T) {
+		t.Parallel()
+		model, server := newTestModel(t, answerAll, WithHeaders(map[string]string{"Authorization": "Provider key", imagesHeader: "true"}))
+		call := noulCall()
+		_, err := model.Decide(t.Context(), call)
+		require.NoError(t, err)
+		require.Equal(t, "Provider key", server.last(t).header.Get("Authorization"))
+		call.Headers = map[string]string{"authorization": "Call key", longContextHeader: "true"}
+		_, err = model.Decide(t.Context(), call)
+		require.NoError(t, err)
+		header := server.last(t).header
+		require.Equal(t, "Call key", header.Get("Authorization"))
+		require.Equal(t, "true", header.Get(imagesHeader))
+		require.Equal(t, "true", header.Get(longContextHeader))
+	})
+
 	t.Run("no authorization without an API key", func(t *testing.T) {
 		t.Parallel()
 
@@ -140,6 +156,8 @@ func TestDecide_Headers(t *testing.T) {
 		}{
 			{name: "no options", options: nil, want: false},
 			{name: "unset", options: NewDecisionProviderOptions(&DecisionProviderOptions{}), want: false},
+			{name: "typed nil", options: fantasy.ProviderOptions{Name: (*DecisionProviderOptions)(nil)}, want: false},
+			{name: "nil entry", options: fantasy.ProviderOptions{Name: nil}, want: false},
 			{name: "nil options", options: NewDecisionProviderOptions(nil), want: false},
 			{name: "false", options: NewDecisionProviderOptions(&DecisionProviderOptions{LongContext: new(false)}), want: false},
 			{name: "true", options: NewDecisionProviderOptions(&DecisionProviderOptions{LongContext: new(true)}), want: true},

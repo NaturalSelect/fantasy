@@ -4,12 +4,11 @@ import (
 	"cmp"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"regexp"
 	"strconv"
-	"strings"
 
 	"charm.land/fantasy"
+	"charm.land/fantasy/providers/internal/httpheaders"
 	"google.golang.org/genai"
 	"google.golang.org/genai/interactions/models/apierrors"
 )
@@ -70,7 +69,7 @@ func toInteractionsProviderErr(err error, apiErr *apierrors.APIError) *fantasy.P
 		ErrorType:    cmp.Or(code, body.Error.Status),
 	}
 	if response := apiErr.RawResponse; response != nil {
-		providerErr.ResponseHeaders = toHeaderMap(response.Header)
+		providerErr.ResponseHeaders = httpheaders.ResponseHeaders(response.Header)
 		if response.Request != nil && response.Request.URL != nil {
 			providerErr.URL = response.Request.URL.String()
 		}
@@ -79,17 +78,6 @@ func toInteractionsProviderErr(err error, apiErr *apierrors.APIError) *fantasy.P
 	parseContextTooLargeError(message, providerErr)
 
 	return providerErr
-}
-
-func toHeaderMap(in http.Header) map[string]string {
-	out := make(map[string]string, len(in)*2)
-	for k, v := range in {
-		if l := len(v); l > 0 {
-			out[k] = v[l-1]
-			out[strings.ToLower(k)] = v[l-1]
-		}
-	}
-	return out
 }
 
 func parseContextTooLargeError(message string, providerErr *fantasy.ProviderError) {

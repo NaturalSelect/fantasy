@@ -1,6 +1,10 @@
 package typesafe
 
-import "charm.land/fantasy"
+import (
+	"encoding/json"
+
+	"charm.land/fantasy"
+)
 
 // QuestionTypeBox asks for the bounding box of something in an image. It is
 // specific to TypeSafe and not supported by jev-1.13.0.
@@ -11,6 +15,48 @@ const QuestionTypeBox fantasy.QuestionType = "box"
 // fantasy.AsAnswer[BoxAnswer].
 type BoxQuestion struct {
 	Instructions fantasy.Text `json:"instructions"`
+}
+
+type boxQuestionJSON struct {
+	Instructions string `json:"instructions"`
+}
+
+func (q BoxQuestion) MarshalJSON() ([]byte, error) {
+	text, err := fantasy.RenderText(q.Instructions)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(boxQuestionJSON{Instructions: text})
+}
+
+func (q *BoxQuestion) UnmarshalJSON(data []byte) error {
+	var v boxQuestionJSON
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	q.Instructions = fantasy.String(v.Instructions)
+	return nil
+}
+
+func init() {
+	fantasy.RegisterQuestionType(QuestionTypeBox, decodeBoxQuestion)
+	fantasy.RegisterAnswerType(QuestionTypeBox, decodeBoxAnswer)
+}
+
+func decodeBoxQuestion(data []byte) (fantasy.Question, error) {
+	var q BoxQuestion
+	if err := json.Unmarshal(data, &q); err != nil {
+		return nil, err
+	}
+	return q, nil
+}
+
+func decodeBoxAnswer(data []byte) (fantasy.Answer, error) {
+	var a BoxAnswer
+	if err := json.Unmarshal(data, &a); err != nil {
+		return nil, err
+	}
+	return a, nil
 }
 
 // GetType implements fantasy.Question.

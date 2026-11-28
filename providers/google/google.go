@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -163,17 +164,37 @@ type languageModel struct {
 	objectMode      fantasy.ObjectMode
 }
 
+// NOTE: Match genai's backend selection before credential lookup; even an unconfigured Vertex account cannot use Decisions.
+func (a *provider) effectiveBackend() genai.Backend {
+	if a.options.backend != genai.BackendUnspecified {
+		return a.options.backend
+	}
+	for _, key := range []string{"GOOGLE_GENAI_USE_ENTERPRISE", "GOOGLE_GENAI_USE_VERTEXAI"} {
+		if value, ok := os.LookupEnv(key); ok {
+			if value == "1" || strings.EqualFold(value, "true") {
+				return genai.BackendVertexAI
+			}
+			break
+		}
+	}
+	return genai.BackendGeminiAPI
+}
+
 func (a *provider) newClient(ctx context.Context) (*genai.Client, error) {
+	return a.newClientForBackend(ctx, a.effectiveBackend())
+}
+
+func (a *provider) newClientForBackend(ctx context.Context, backend genai.Backend) (*genai.Client, error) {
 	cc := &genai.ClientConfig{
 		HTTPClient: wrapHTTPClient(a.options.client),
-		Backend:    a.options.backend,
+		Backend:    backend,
 		APIKey:     a.options.apiKey,
 		Project:    a.options.project,
 		Location:   a.options.location,
 	}
 	if a.options.skipAuth {
 		cc.Credentials = &auth.Credentials{TokenProvider: dummyTokenProvider{}}
-	} else if cc.Backend == genai.BackendVertexAI {
+	} else if a.options.backend == genai.BackendVertexAI {
 		if err := cc.UseDefaultCredentials(); err != nil {
 			return nil, err
 		}
